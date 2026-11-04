@@ -25,9 +25,9 @@ DB_PATH = os.path.join(BASE_DIR, "guard.db")
 UI_DIR = os.environ.get("HFISH_GUARD_UI", "/vol2/@appcenter/hfish-guard/bin/ui")
 PORT = int(os.environ.get("HFISH_GUARD_PORT", "9705"))
 
-SEEN_SET = "hfish_guard_seen"
-WHITE_SET = "hfish_guard_white"
-BLACK_SET = "hfish_guard_black"
+SEEN = "hfish_guard_seen"
+WHITE = "hfish_guard_white"
+BLACK = "hfish_guard_black"
 
 POLL_INTERVAL = 10          # 轮询 seen 集合周期（秒）
 EXPIRY_TICKS = 6            # 每 N 个轮询周期跑一次过期清理

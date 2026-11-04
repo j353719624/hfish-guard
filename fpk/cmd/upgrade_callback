@@ -15,18 +15,17 @@ fi
 if [ -z "$TOKEN" ]; then
   TOKEN=$(/usr/bin/python3 -c "import random,string;print(''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(24)))" 2>/dev/null)
 fi
-if [ -f "${DATA}/config.json" ]; then
-  /usr/bin/python3 - "$TOKEN" <<'PYEOF'
-import json, sys
+/usr/bin/python3 - "$TOKEN" <<'PYEOF'
+import json, sys, os
 p = "/vol2/@appdata/hfish-guard/config.json"
 try:
     cfg = json.load(open(p))
 except Exception:
     cfg = {}
 cfg["token"] = sys.argv[1]
+os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(cfg, open(p, "w"), ensure_ascii=False, indent=2)
 PYEOF
-fi
 for UICFG in /var/apps/hfish-guard/ui/config /vol2/@appcenter/hfish-guard/ui/config; do
   [ -f "$UICFG" ] && sed -i "s|CHANGE_ME|${TOKEN}|g" "$UICFG" 2>/dev/null
 done

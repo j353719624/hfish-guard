@@ -16,18 +16,18 @@ fi
 if [ -z "$TOKEN" ]; then
   TOKEN=$(/usr/bin/python3 -c "import random,string;print(''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(24)))" 2>/dev/null)
 fi
-if [ -f "${DATA}/config.json" ]; then
-  /usr/bin/python3 - "$TOKEN" <<'PYEOF'
-import json, sys
+# 关键：确保 config.json 一定存在且带同一个 token（守护启动时不再自行生成，避免与 UI 入口错位）
+/usr/bin/python3 - "$TOKEN" <<'PYEOF'
+import json, sys, os
 p = "/vol2/@appdata/hfish-guard/config.json"
 try:
     cfg = json.load(open(p))
 except Exception:
     cfg = {}
 cfg["token"] = sys.argv[1]
+os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(cfg, open(p, "w"), ensure_ascii=False, indent=2)
 PYEOF
-fi
 # fnOS 把 ui/config 解到 /var/apps/<app>/ui/config，替换其中的 token 占位
 for UICFG in /var/apps/hfish-guard/ui/config /vol2/@appcenter/hfish-guard/ui/config; do
   [ -f "$UICFG" ] && sed -i "s|CHANGE_ME|${TOKEN}|g" "$UICFG" 2>/dev/null
