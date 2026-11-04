@@ -125,7 +125,7 @@ class Store:
 # ---------------------------------------------------------------- ipset / iptables
 def ipset_members(name):
     """返回 {ip: packets}，解析 ipset list 输出（counters 模式）"""
-    rc, out = sh(f"ipset list {name} 2>/dev/null")
+    rc, out = sh(f"/usr/sbin/ipset list {name} 2>/dev/null")
     members = {}
     in_members = False
     for line in out.splitlines():
@@ -147,15 +147,15 @@ def ipset_members(name):
 
 
 def ensure_sets():
-    sh(f"ipset create {SEEN} hash:ip counters timeout 120 -exist")
-    sh(f"ipset create {WHITE} hash:ip -exist")
-    sh(f"ipset create {BLACK} hash:ip -exist")
+    sh(f"/usr/sbin/ipset create {SEEN} hash:ip counters timeout 120 -exist")
+    sh(f"/usr/sbin/ipset create {WHITE} hash:ip -exist")
+    sh(f"/usr/sbin/ipset create {BLACK} hash:ip -exist")
 
 
 def sync_whitelist(whitelist):
-    sh(f"ipset flush {WHITE}")
+    sh(f"/usr/sbin/ipset flush {WHITE}")
     for ip in whitelist:
-        sh(f"ipset add {WHITE} {ip} -exist 2>/dev/null")
+        sh(f"/usr/sbin/ipset add {WHITE} {ip} -exist 2>/dev/null")
 
 
 def apply_trap(ports, prev_ports=None):
@@ -164,25 +164,25 @@ def apply_trap(ports, prev_ports=None):
     for p in (prev_ports or []):
         if p and ",".join(p) != port_str:
             old = ",".join(p)
-            sh(f'iptables -D INPUT -p tcp -m multiport --dports {old} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
-    rc, _ = sh(f'iptables -C INPUT -p tcp -m multiport --dports {port_str} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
+            sh(f'/usr/sbin/iptables -D INPUT -p tcp -m multiport --dports {old} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
+    rc, _ = sh(f'/usr/sbin/iptables -C INPUT -p tcp -m multiport --dports {port_str} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
     if rc != 0:
-        sh(f'iptables -I INPUT 1 -p tcp -m multiport --dports {port_str} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src')
-    rc, _ = sh(f'iptables -C INPUT -m set --match-set {BLACK} src -j DROP 2>/dev/null')
+        sh(f'/usr/sbin/iptables -I INPUT 1 -p tcp -m multiport --dports {port_str} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src')
+    rc, _ = sh(f'/usr/sbin/iptables -C INPUT -m set --match-set {BLACK} src -j DROP 2>/dev/null')
     if rc != 0:
-        sh(f'iptables -I INPUT 2 -m set --match-set {BLACK} src -j DROP')
+        sh(f'/usr/sbin/iptables -I INPUT 2 -m set --match-set {BLACK} src -j DROP')
 
 
 def remove_rules(ports):
     port_str = ",".join(ports)
-    sh(f'iptables -D INPUT -p tcp -m multiport --dports {port_str} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
-    sh(f'iptables -D INPUT -m set --match-set {BLACK} src -j DROP 2>/dev/null')
+    sh(f'/usr/sbin/iptables -D INPUT -p tcp -m multiport --dports {port_str} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
+    sh(f'/usr/sbin/iptables -D INPUT -m set --match-set {BLACK} src -j DROP 2>/dev/null')
     for s in (SEEN, WHITE, BLACK):
-        sh(f"ipset destroy {s} 2>/dev/null")
+        sh(f"/usr/sbin/ipset destroy {s} 2>/dev/null")
 
 
 def trap_present(ports):
-    rc, _ = sh(f'iptables -C INPUT -p tcp -m multiport --dports {",".join(ports)} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
+    rc, _ = sh(f'/usr/sbin/iptables -C INPUT -p tcp -m multiport --dports {",".join(ports)} -m set ! --match-set {WHITE} src -j SET --add-set {SEEN} src 2>/dev/null')
     return rc == 0
 
 
@@ -243,9 +243,9 @@ class Guard:
             detail = "命中蜜罐端口 %s，%ds 内 %d 包" % (",".join(cfg["ports"]), window, total)
             self.store.event(ip, total, action, detail)
             if mode == "block":
-                sh(f"ipset add {BLACK} {ip} -exist")
+                sh(f"/usr/sbin/ipset add {BLACK} {ip} -exist")
                 self.store.add_block(ip, total, detail)
-                sh(f"ipset del {SEEN} {ip} 2>/dev/null")
+                sh(f"/usr/sbin/ipset del {SEEN} {ip} 2>/dev/null")
                 self.prev.pop(ip, None)
             window_hits = {k: v for k, v in window_hits.items() if k[0] != ip}
 
@@ -253,7 +253,7 @@ class Guard:
         if self.tick % EXPIRY_TICKS == 0:
             for ip, ts, expire, reason, hits in self.store.active_blocks():
                 if expire and expire > 0 and time.time() > expire:
-                    sh(f"ipset del {BLACK} {ip} 2>/dev/null")
+                    sh(f"/usr/sbin/ipset del {BLACK} {ip} 2>/dev/null")
                     self.store.unblock(ip)
                     self.store.event(ip, hits, "过期解封", "TTL 到期自动解封")
         self.last_poll = now
@@ -379,13 +379,13 @@ class Handler(BaseHTTPRequestHandler):
             if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
                 self._json({"error": "bad ip"}, 400)
                 return
-            sh(f"ipset add {BLACK} {ip} -exist")
+            sh(f"/usr/sbin/ipset add {BLACK} {ip} -exist")
             STORE.add_block(ip, 0, "手动添加")
             STORE.event(ip, 0, "手动封禁", body.get("reason", ""))
             self._json({"ok": True})
         elif path == "/api/blacklist/delete":
             ip = (body.get("ip") or "").strip()
-            sh(f"ipset del {BLACK} {ip} 2>/dev/null")
+            sh(f"/usr/sbin/ipset del {BLACK} {ip} 2>/dev/null")
             STORE.unblock(ip)
             STORE.event(ip, 0, "手动解封", "")
             self._json({"ok": True})
@@ -399,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/blacklist/"):
             ip = path.rsplit("/", 1)[-1]
-            sh(f"ipset del {BLACK} {ip} 2>/dev/null")
+            sh(f"/usr/sbin/ipset del {BLACK} {ip} 2>/dev/null")
             STORE.unblock(ip)
             STORE.event(ip, 0, "手动解封", "")
             self._json({"ok": True})
