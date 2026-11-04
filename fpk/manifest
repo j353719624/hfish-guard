@@ -1,0 +1,14 @@
+appname = hfish-guard
+version = 1.0.0
+display_name = 蜜罐守卫 HFish Guard
+desc = <p><strong>蜜罐联动自动封禁</strong>　监视蜜罐端口命中，阈值触发自动拉黑攻击 IP（观察/封禁双模式），支持白名单豁免、黑名单自动过期、攻击日志与可视化管理。</p><p><strong>联动</strong>　自动跟随蜜罐服务端口；与 HFish 蜜罐（hive 应用）配合使用。</p>
+platform = x86
+source = thirdparty
+maintainer = Hive
+maintainer_url = https://hfish.net
+distributor = Hive
+os_min_version = 1.2.0401
+ctl_stop = true
+desktop_uidir = ui
+desktop_applaunchname = hfish-guard.Application
+checkport = false

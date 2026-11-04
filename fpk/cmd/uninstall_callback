@@ -1,0 +1,19 @@
+#!/bin/bash
+set -u
+# 卸载后：停守护 → 移除 iptables 规则与 ipset → 删单元（保留 ${DATA} 数据，用户可手动清理）
+systemctl disable --now hfish-guard.service 2>/dev/null || true
+rm -f /etc/systemd/system/hfish-guard.service
+systemctl daemon-reload 2>/dev/null || true
+
+# 清理本应用的 iptables 规则与 ipset（蜜罐本体 hive 的规则不受影响）
+for SET in hfish_guard_seen hfish_guard_white hfish_guard_black; do
+  for i in 1 2 3 4 5; do
+    RULE=$(iptables -L INPUT --line-numbers -n 2>/dev/null | grep "match-set ${SET} " | awk '{print $1}' | head -1)
+    [ -z "$RULE" ] && break
+    iptables -D INPUT "$RULE" 2>/dev/null || break
+  done
+  ipset destroy "$SET" 2>/dev/null || true
+done
+
+echo "hfish-guard: uninstalled (data kept at /vol2/@appdata/hfish-guard)" >&2
+exit 0

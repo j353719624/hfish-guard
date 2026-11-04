@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "hfish-guard.Application": {
+      "title": "蜜罐守卫",
+      "desc": "蜜罐联动自动封禁",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "http",
+      "port": "9705",
+      "url": "/web/?token=CHANGE_ME",
+      "allUsers": false
+    }
+  }
+}

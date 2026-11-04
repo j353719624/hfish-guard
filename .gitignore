@@ -1,0 +1,12 @@
+# 打包产物（二进制只发 Releases）
+dist/
+*.fpk
+app.tgz
+*.tgz
+*.tar.gz
+
+# 运行时
+*.log
+*.pid
+__pycache__/
+*.pyc

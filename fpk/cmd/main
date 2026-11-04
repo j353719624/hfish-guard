@@ -1,0 +1,27 @@
+#!/bin/bash
+set -u
+BIN="/vol2/@appcenter/hfish-guard/bin"
+UNIT=hfish-guard.service
+UNIT_FILE=/etc/systemd/system/${UNIT}
+
+case "${1:-start}" in
+  start)
+    if [ -f "${UNIT_FILE}" ]; then systemctl start "${UNIT}"
+    else /usr/bin/python3 "${BIN}/guard.py" & fi ;;
+  stop)
+    systemctl stop "${UNIT}" 2>/dev/null
+    pkill -f "hfish-guard/bin/guard.py" 2>/dev/null
+    echo stopped ;;
+  restart)
+    if [ -f "${UNIT_FILE}" ]; then systemctl restart "${UNIT}"
+    else pkill -f "hfish-guard/bin/guard.py" 2>/dev/null; /usr/bin/python3 "${BIN}/guard.py" & fi ;;
+  status)
+    if systemctl is-active --quiet "${UNIT}" 2>/dev/null; then
+      echo running
+    elif pgrep -f "hfish-guard/bin/guard.py" >/dev/null 2>&1; then
+      echo running
+    else
+      echo stopped
+    fi ;;
+  *) echo "usage: $0 start|stop|restart|status" ;;
+esac

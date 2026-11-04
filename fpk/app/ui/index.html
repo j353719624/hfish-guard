@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>蜜罐守卫 · HFish Guard</title>
+<style>
+:root{--bg:#12141c;--card:#1b1f2a;--line:#2a3040;--txt:#d8dce6;--dim:#8a92a6;--acc:#ff5b5b;--ok:#4ade80;--warn:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;padding:18px}
+h1{font-size:20px;display:flex;align-items:center;gap:10px}
+h1 .badge{font-size:12px;padding:2px 10px;border-radius:10px}
+.badge.observe{background:#334155;color:var(--warn)}
+.badge.block{background:#7f1d1d;color:#fecaca}
+.badge.ok{background:#14532d;color:var(--ok)}
+.badge.err{background:#7f1d1d;color:#fecaca}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:14px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card .k{color:var(--dim);font-size:12px}
+.card .v{font-size:22px;font-weight:600;margin-top:4px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+section h2{font-size:15px;margin-bottom:10px;color:#aeb6c8}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-weight:500}
+td .tag{padding:1px 8px;border-radius:8px;font-size:12px}
+.tag.block{background:#7f1d1d;color:#fecaca}
+.tag.observe{background:#334155;color:var(--warn)}
+.tag.expire{background:#14532d;color:var(--ok)}
+.tag.manual{background:#1e3a8a;color:#bfdbfe}
+form{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+input,select{background:#12141c;border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:6px 10px;font-size:13px;min-width:110px}
+button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 16px;font-size:13px;cursor:pointer}
+button.gray{background:#39415a}
+button.mini{padding:3px 10px;font-size:12px;background:#39415a}
+button.danger{background:#7f1d1d}
+#toast{position:fixed;right:18px;bottom:18px;background:#0b3d91;color:#fff;padding:10px 16px;border-radius:8px;display:none}
+.mono{font-family:Consolas,monospace}
+.small{color:var(--dim);font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<h1>🛡 蜜罐守卫 <span id="mode" class="badge">-</span> <span id="trap" class="badge">-</span></h1>
+
+<div class="grid">
+  <div class="card"><div class="k">黑名单</div><div class="v" id="st-black">-</div></div>
+  <div class="card"><div class="k">窗口阈值</div><div class="v" id="st-th">-</div></div>
+  <div class="card"><div class="k">监视端口</div><div class="v mono" style="font-size:13px" id="st-ports">-</div></div>
+  <div class="card"><div class="k">最近轮询</div><div class="v" style="font-size:14px" id="st-poll">-</div></div>
+</div>
+
+<section>
+  <h2>联动配置</h2>
+  <form id="cfg">
+    <label>模式<select id="c-mode"><option value="observe">观察（只记录）</option><option value="block">封禁（自动拉黑）</option></select></label>
+    <label>阈值（包/窗口）<input id="c-th" type="number" min="5" max="100000"></label>
+    <label>窗口（秒）<input id="c-win" type="number" min="10" max="3600"></label>
+    <label>黑名单过期（秒，0=永久）<input id="c-ttl" type="number" min="0" max="2592000"></label>
+    <label style="flex:1">监视端口（逗号分隔，与蜜罐服务一致）<input id="c-ports" class="mono" style="width:100%"></label>
+    <button type="submit">保存配置</button>
+  </form>
+  <div class="small">默认观察模式只记录不封禁；确认阈值合理后再切换为封禁模式。白名单 IP 永不触发。</div>
+</section>
+
+<section>
+  <h2>白名单（永不触发/封禁）</h2>
+  <form id="wl"><input id="wl-ip" placeholder="192.168.110.x" required><button type="submit">添加</button></form>
+  <div id="wl-list" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px"></div>
+</section>
+
+<section>
+  <h2>黑名单</h2>
+  <form id="bl"><input id="bl-ip" placeholder="手动封禁 IP" required><input id="bl-reason" placeholder="原因（可选）"><button type="submit" class="danger">手动封禁</button></form>
+  <div style="margin-top:10px;overflow-x:auto"><table id="bl-table"><thead><tr><th>IP</th><th>加入时间</th><th>过期</th><th>命中</th><th>原因</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+</section>
+
+<section>
+  <h2>攻击事件（最近 100 条）</h2>
+  <div style="overflow-x:auto"><table id="ev-table"><thead><tr><th>时间</th><th>来源 IP</th><th>命中包数</th><th>动作</th><th>详情</th></tr></thead><tbody></tbody></table></div>
+</section>
+
+<div id="toast"></div>
+<script>
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const $ = id => document.getElementById(id);
+const fmt = ts => ts ? new Date(ts * 1000).toLocaleString("zh-CN") : "-";
+function toast(msg){ const t = $("toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => t.style.display = "none", 2500); }
+async function api(path, opt = {}) {
+  opt.headers = Object.assign({"X-Token": TOKEN}, opt.headers || {});
+  if (opt.body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(opt.body); }
+  const r = await fetch(path, opt);
+  if (r.status === 401) { document.body.innerHTML = "<h1>token 无效，请从飞牛面板进入</h1>"; throw new Error("401"); }
+  return r.json();
+}
+function esc(s){ return String(s ?? "").replace(/[<>&"]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c])); }
+
+async function refresh() {
+  try {
+    const s = await api("/api/status");
+    $("mode").textContent = s.mode === "block" ? "封禁模式" : "观察模式";
+    $("mode").className = "badge " + s.mode;
+    $("trap").textContent = s.trap ? "陷阱正常" : "陷阱缺失";
+    $("trap").className = "badge " + (s.trap ? "ok" : "err");
+    $("st-black").textContent = s.blacklist_count;
+    $("st-th").textContent = s.threshold + " 包 / " + s.window + "s";
+    $("st-ports").textContent = (s.ports || []).join(", ");
+    $("st-poll").textContent = s.last_poll ? new Date(s.last_poll * 1000).toLocaleTimeString("zh-CN") : "-";
+    if (!$("c-mode").dataset.dirty) {
+      $("c-mode").value = s.mode; $("c-th").value = s.threshold; $("c-win").value = s.window;
+      $("c-ttl").value = s.ttl; $("c-ports").value = (s.ports || []).join(",");
+    }
+    const bl = await api("/api/blacklist");
+    $("bl-table").querySelector("tbody").innerHTML = bl.map(b => `
+      <tr><td class="mono">${esc(b.ip)}</td><td>${fmt(b.ts)}</td>
+      <td>${b.expire ? fmt(b.expire) : "永久"}</td><td>${esc(b.hits)}</td>
+      <td>${esc(b.reason)}</td>
+      <td><button class="mini" onclick="delBlack('${esc(b.ip)}')">解封</button></td></tr>`).join("") || "<tr><td colspan=6>空</td></tr>";
+    const ev = await api("/api/events");
+    $("ev-table").querySelector("tbody").innerHTML = ev.map(e => `
+      <tr><td>${fmt(e.ts)}</td><td class="mono">${esc(e.ip)}</td><td>${esc(e.hits)}</td>
+      <td><span class="tag ${e.action.includes("封禁") ? "block" : e.action.includes("解封") ? "expire" : "manual"}">${esc(e.action)}</span></td>
+      <td>${esc(e.detail)}</td></tr>`).join("") || "<tr><td colspan=5>暂无事件</td></tr>";
+  } catch (e) { console.error(e); }
+}
+async function delBlack(ip){ if (!confirm("解封 " + ip + "？")) return; await api("/api/blacklist/delete", {method: "POST", body: {ip}}); toast("已解封 " + ip); refresh(); }
+$("cfg").addEventListener("submit", async e => {
+  e.preventDefault();
+  await api("/api/config", {method: "POST", body: {
+    mode: $("c-mode").value, threshold: +$("c-th").value, window: +$("c-win").value,
+    ttl: +$("c-ttl").value, ports: $("c-ports").value }});
+  $("c-mode").dataset.dirty = ""; toast("配置已保存并即时生效"); refresh();
+});
+$("c-mode").addEventListener("change", () => $("c-mode").dataset.dirty = "1");
+$("wl").addEventListener("submit", async e => {
+  e.preventDefault();
+  const ip = $("wl-ip").value.trim(); if (!ip) return;
+  const s = await api("/api/status");
+  const list = s.whitelist.slice();
+  if (!list.includes(ip)) list.push(ip);
+  await api("/api/config", {method: "POST", body: {whitelist: list}});
+  $("wl-ip").value = ""; toast("已加入白名单"); refresh(); renderWl(list);
+});
+async function renderWl(list) {
+  if (!list) { const s = await api("/api/status"); list = s.whitelist; }
+  $("wl-list").innerHTML = list.map(ip => `
+    <span class="card" style="padding:4px 10px">${esc(ip)}
+    <button class="mini" onclick="delWl('${esc(ip)}')">✕</button></span>`).join("");
+}
+async function delWl(ip){
+  const s = await api("/api/status");
+  const list = s.whitelist.filter(x => x !== ip);
+  await api("/api/config", {method: "POST", body: {whitelist: list}});
+  toast("已移除 " + ip); refresh(); renderWl(list);
+}
+$("bl").addEventListener("submit", async e => {
+  e.preventDefault();
+  await api("/api/blacklist", {method: "POST", body: {ip: $("bl-ip").value.trim(), reason: $("bl-reason").value}});
+  $("bl-ip").value = ""; $("bl-reason").value = ""; toast("已封禁"); refresh();
+});
+renderWl(); refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

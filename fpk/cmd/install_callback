@@ -1,0 +1,57 @@
+#!/bin/bash
+set -u
+# 安装后：生成 token → 写入 UI 入口 → 注册 systemd 托管 → 立即启动
+BIN=/vol2/@appcenter/hfish-guard/bin
+DATA=/vol2/@appdata/hfish-guard
+UNIT=/etc/systemd/system/hfish-guard.service
+
+chmod 755 "${BIN}/guard.py" 2>/dev/null || true
+mkdir -p "${DATA}"
+
+# 1) 生成随机 token 并写进守护配置 + 飞牛桌面入口 URL
+TOKEN=""
+if [ -f "${DATA}/config.json" ]; then
+  TOKEN=$(/usr/bin/python3 -c "import json;print(json.load(open('${DATA}/config.json')).get('token',''))" 2>/dev/null)
+fi
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(/usr/bin/python3 -c "import random,string;print(''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(24)))" 2>/dev/null)
+fi
+if [ -f "${DATA}/config.json" ]; then
+  /usr/bin/python3 - "$TOKEN" <<'PYEOF'
+import json, sys
+p = "/vol2/@appdata/hfish-guard/config.json"
+try:
+    cfg = json.load(open(p))
+except Exception:
+    cfg = {}
+cfg["token"] = sys.argv[1]
+json.dump(cfg, open(p, "w"), ensure_ascii=False, indent=2)
+PYEOF
+fi
+# fnOS 把 ui/config 解到 /var/apps/<app>/ui/config，替换其中的 token 占位
+for UICFG in /var/apps/hfish-guard/ui/config /vol2/@appcenter/hfish-guard/ui/config; do
+  [ -f "$UICFG" ] && sed -i "s|CHANGE_ME|${TOKEN}|g" "$UICFG" 2>/dev/null
+done
+
+# 2) systemd 托管：装完即启 + 开机自启 + 崩溃自愈
+cat > "$UNIT" <<'EOF'
+[Unit]
+Description=HFish Guard - honeypot linkage auto-block
+After=network-online.target hive-honeypot.service
+Wants=network-online.target hive-honeypot.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ -x /vol2/@appcenter/hfish-guard/bin/guard.py ] && exit 0; sleep 2; done; exit 1'
+ExecStart=/usr/bin/python3 /vol2/@appcenter/hfish-guard/bin/guard.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable --now hfish-guard.service 2>/dev/null || /usr/bin/python3 "${BIN}/guard.py" &
+
+echo "hfish-guard: install_callback done (token=${TOKEN})" >&2
+exit 0
