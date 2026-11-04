@@ -82,7 +82,7 @@ button.danger{background:#7f1d1d}
 
 <div id="toast"></div>
 <script>
-const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const TOKEN = "";
 const $ = id => document.getElementById(id);
 const fmt = ts => ts ? new Date(ts * 1000).toLocaleString("zh-CN") : "-";
 function toast(msg){ const t = $("toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => t.style.display = "none", 2500); }

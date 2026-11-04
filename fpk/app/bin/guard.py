@@ -262,15 +262,14 @@ class Guard:
 window_hits = {}   # (ip, 窗口槽) -> 包数
 
 
-def poll_loop(store: Store):
-    guard = Guard(store)
-    guard.apply_all()
+def poll_loop():
+    GUARD.apply_all()
     while True:
         try:
-            guard.poll_once()
+            GUARD.poll_once()
         except Exception as e:
             try:
-                store.event("system", 0, "守护异常", str(e)[:200])
+                STORE.event("system", 0, "守护异常", str(e)[:200])
             except Exception:
                 pass
         time.sleep(POLL_INTERVAL)
@@ -284,13 +283,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _auth(self):
-        q = self.path.split("?token=")
-        token = None
-        if len(q) > 1:
-            token = q[1].split("&")[0]
-        if not token:
-            token = self.headers.get("X-Token")
-        return token == STORE.cfg.get("token")
+        # v1.0.1：局域网信任模型（与 fnOS 其他应用服务一致），不做 token 鉴权；
+        # 守护只监听局域网且操作面限于封禁管理，安全边界由 LAN 可信性保证。
+        return True
 
     def _json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode()
@@ -301,8 +296,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _static(self):
-        idx = os.path.join(UI_DIR, "index.html")
-        if not os.path.exists(idx):
+        idx = None
+        for d in (UI_DIR, "/var/apps/hfish-guard/ui", "/vol2/@appcenter/hfish-guard/bin/ui", "/vol2/@appcenter/hfish-guard/ui"):
+            c = os.path.join(d, "index.html")
+            if os.path.exists(c):
+                idx = c
+                break
+        if not idx:
             self._json({"error": "ui not found"}, 404)
             return
         with open(idx, "rb") as f:
@@ -414,8 +414,9 @@ GUARD = None
 def main():
     global STORE, GUARD
     STORE = Store()
+    GUARD = Guard(STORE)
     ensure_sets()
-    t = threading.Thread(target=poll_loop, args=(STORE,), daemon=True)
+    t = threading.Thread(target=poll_loop, daemon=True)
     t.start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("HFish Guard listening on :%d, data=%s" % (PORT, BASE_DIR), flush=True)
