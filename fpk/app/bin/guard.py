@@ -155,16 +155,21 @@ def is_root():
 
 
 def valid_ip(s):
-    return bool(IP_RE.match(s or "")) and all(int(x) <= 255 for x in s.split("."))
+    """接受 IPv4 与 IPv6 单地址（双栈后不能再只认点分十进制）。"""
+    try:
+        ipaddress.ip_address(str(s or "").strip())
+        return True
+    except ValueError:
+        return False
 
 
 def valid_cidr(s):
-    if not CIDR_RE.match(s or ""):
+    """接受 IPv4/IPv6 网段（白名单要能写 ::1、2409:.../64 这类条目）。"""
+    try:
+        ipaddress.ip_network(str(s or "").strip(), strict=False)
+        return True
+    except ValueError:
         return False
-    addr, _, mask = s.partition("/")
-    if not valid_ip(addr):
-        return False
-    return not mask or (mask.isdigit() and 0 <= int(mask) <= 32)
 
 
 def ip_int(s):
@@ -1887,7 +1892,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route_delete(self, path):
         self._require_auth()
         if path.startswith("/api/blacklist/"):
-            ip = path[len("/api/blacklist/"):].strip()
+            # 路径里的 IPv6 字面量会被客户端百分号编码（2409%3A...），必须解码
+            ip = urllib.parse.unquote(path[len("/api/blacklist/"):]).strip()
             if not valid_ip(ip):
                 raise ApiError(400, "IP 不合法")
             MONITOR.kernel.del_black(ip)
@@ -1896,7 +1902,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
         if path.startswith("/api/whitelist/"):
-            cidr = path[len("/api/whitelist/"):].strip()
+            cidr = urllib.parse.unquote(path[len("/api/whitelist/"):]).strip()
             if not valid_cidr(cidr):
                 raise ApiError(400, "CIDR 不合法")
             STORE.cfg["whitelist"] = [w for w in STORE.cfg["whitelist"] if w.get("cidr") != cidr]

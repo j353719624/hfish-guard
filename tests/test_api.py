@@ -21,6 +21,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -693,6 +694,15 @@ class ScanDetectTest(ApiBase):
         self.assertFalse(self.call("GET", "/api/config")["udp"])
         cfg = self.call("PUT", "/api/config", {"udp": True})
         self.assertTrue(cfg["config"]["udp"])
+
+    def test_07_ipv6_block_unblock_via_encoded_path(self):
+        # IPv6 字面量在 URL 路径里会被百分号编码，服务端必须能解出原地址
+        ip = "2409:8a20:2485:cb30::157d"
+        self.assertEqual(self.status_code("POST", "/api/blacklist", {"ip": ip}), 200)
+        self.assertIn(ip, [b["ip"] for b in self.call("GET", "/api/blacklist")])
+        code = self.status_code("DELETE", "/api/blacklist/" + quote(ip, safe=""))
+        self.assertEqual(code, 200, "百分号编码的 IPv6 解封应返回 200")
+        self.assertNotIn(ip, [b["ip"] for b in self.call("GET", "/api/blacklist")])
 
     def test_06_kernel_reports_ipv6_capability(self):
         k = self.call("GET", "/api/status")["kernel"]
