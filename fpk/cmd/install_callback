@@ -43,7 +43,9 @@ Wants=network-online.target hive-honeypot.service
 [Service]
 Type=simple
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ -x /vol2/@appcenter/hfish-guard/bin/guard.py ] && exit 0; sleep 2; done; exit 1'
-ExecStart=/usr/bin/python3 /vol2/@appcenter/hfish-guard/bin/guard.py
+Environment=PYTHONUNBUFFERED=1
+Environment=HFISH_GUARD_DATA=/vol2/@appdata/hfish-guard
+ExecStart=/usr/bin/python3 -u /vol2/@appcenter/hfish-guard/bin/guard.py
 Restart=always
 RestartSec=3
 

@@ -1,30 +1,44 @@
 #!/bin/bash
+# fnOS 应用启停入口。
+# 守护进程由 systemd 托管（见 install_callback）。这里必须优先走 systemctl：
+# 直接 pkill 的话 systemd 的 Restart=always 会立刻把进程拉起来，停止按钮形同虚设。
 set -u
-BIN="/vol2/@appcenter/hfish-guard/bin"
-DATA="/vol2/@appdata/hfish-guard"
+APP="hfish-guard"
+BIN="/vol2/@appcenter/${APP}/bin"
+DATA="/vol2/@appdata/${APP}"
 LOG="${DATA}/guard.log"
+UNIT="/etc/systemd/system/${APP}.service"
+
+have_systemd() { [ -f "${UNIT}" ] && command -v systemctl >/dev/null 2>&1; }
+running() { pgrep -f "${APP}/bin/guard.py" >/dev/null 2>&1; }
 
 case "${1:-start}" in
   start)
-    if pgrep -f "hfish-guard/bin/guard.py" >/dev/null 2>&1; then
-      echo already-running
-    else
-      cd "${BIN}" && setsid /usr/bin/python3 guard.py >>"${LOG}" 2>&1 &
-      echo started
-    fi ;;
+    if have_systemd; then
+      systemctl start "${APP}.service" 2>/dev/null || true
+    fi
+    if ! running; then
+      mkdir -p "${DATA}"
+      cd "${BIN}" && setsid /usr/bin/python3 -u guard.py >>"${LOG}" 2>&1 &
+    fi
+    echo started ;;
   stop)
-    pkill -f "hfish-guard/bin/guard.py" 2>/dev/null
+    if have_systemd; then
+      systemctl stop "${APP}.service" 2>/dev/null || true
+    fi
+    pkill -f "${APP}/bin/guard.py" 2>/dev/null
     echo stopped ;;
   restart)
-    pkill -f "hfish-guard/bin/guard.py" 2>/dev/null
+    if have_systemd; then
+      systemctl restart "${APP}.service" 2>/dev/null && { echo restarted; exit 0; }
+      systemctl stop "${APP}.service" 2>/dev/null || true
+    fi
+    pkill -f "${APP}/bin/guard.py" 2>/dev/null
     sleep 1
-    cd "${BIN}" && setsid /usr/bin/python3 guard.py >>"${LOG}" 2>&1 &
+    mkdir -p "${DATA}"
+    cd "${BIN}" && setsid /usr/bin/python3 -u guard.py >>"${LOG}" 2>&1 &
     echo restarted ;;
   status)
-    if pgrep -f "hfish-guard/bin/guard.py" >/dev/null 2>&1; then
-      echo running
-    else
-      echo stopped
-    fi ;;
+    if running; then echo running; else echo stopped; fi ;;
   *) echo "usage: $0 start|stop|restart|status" ;;
 esac

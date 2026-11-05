@@ -1,19 +1,32 @@
 #!/bin/bash
 set -u
 # 卸载后：停守护 → 移除 iptables 规则与 ipset → 删单元（保留 ${DATA} 数据，用户可手动清理）
-systemctl disable --now hfish-guard.service 2>/dev/null || true
-rm -f /etc/systemd/system/hfish-guard.service
+APP="hfish-guard"
+DATA="/vol2/@appdata/${APP}"
+IPT="/usr/sbin/iptables"
+IPS="/usr/sbin/ipset"
+
+systemctl disable --now "${APP}.service" 2>/dev/null || true
+rm -f "/etc/systemd/system/${APP}.service"
 systemctl daemon-reload 2>/dev/null || true
 
-# 清理本应用的 iptables 规则与 ipset（蜜罐本体 hive 的规则不受影响）
-for SET in hfish_guard_seen hfish_guard_white hfish_guard_black; do
-  for i in 1 2 3 4 5; do
-    RULE=$(iptables -L INPUT --line-numbers -n 2>/dev/null | grep "match-set ${SET} " | awk '{print $1}' | head -1)
-    [ -z "$RULE" ] && break
-    iptables -D INPUT "$RULE" 2>/dev/null || break
-  done
-  ipset destroy "$SET" 2>/dev/null || true
-done
+# 本应用的集合命名：hfish_guard_white / hfish_guard_black / hfish_guard_seen_<端口>
+# 逐端口集合是 v1.1 之后才有的，卸载时必须一并清掉，否则残留 DROP 规则会一直生效。
+SETS=$("${IPS}" list -n 2>/dev/null | grep -E '^hfish_guard_(seen_[0-9]+|white|black)$' || true)
 
-echo "hfish-guard: uninstalled (data kept at /vol2/@appdata/hfish-guard)" >&2
+# 先删引用这些集合的 INPUT 规则，再销毁集合（顺序反了 iptables 会拒绝删除集合）
+for SET in ${SETS:-hfish_guard_white hfish_guard_black}; do
+  for _ in 1 2 3 4 5 6; do
+    LINE=$("${IPT}" -L INPUT --line-numbers -n 2>/dev/null | grep "match-set ${SET} " | awk '{print $1}' | head -1)
+    [ -z "${LINE}" ] && break
+    "${IPT}" -D INPUT "${LINE}" 2>/dev/null || break
+  done
+done
+for SET in ${SETS:-}; do
+  "${IPS}" destroy "${SET}" 2>/dev/null || true
+done
+# 兜底：老版本可能残留不带端口的 seen 集合
+"${IPS}" destroy hfish_guard_seen 2>/dev/null || true
+
+echo "${APP}: uninstalled (data kept at ${DATA})" >&2
 exit 0
