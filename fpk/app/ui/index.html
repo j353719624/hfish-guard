@@ -160,7 +160,7 @@ select.input{appearance:none;background-image:linear-gradient(45deg,transparent 
 .rail-foot div{font-size:11.5px;color:var(--t3);line-height:1.9}
 .rail-foot b{color:var(--t2);font-weight:500}
 .main{flex:1;min-width:0;padding:24px 28px 48px;background-color:var(--ink-000);background-image:linear-gradient(rgba(255,255,255,.014) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);background-size:32px 32px;overflow-x:hidden}
-.view{max-width:1460px;margin:0 auto;animation:viewIn var(--normal) both}
+.view{max-width:none;margin:0;animation:viewIn var(--normal) both}
 @keyframes viewIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .view-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:20px}
 .view-title{font-size:22px;font-weight:500;letter-spacing:.01em;margin:6px 0 0;outline:none}
@@ -705,8 +705,8 @@ select.input{background-color:rgba(3,12,24,.72)}
 .hp-note{font-size:10px;color:#6F9DBE;line-height:1.6}
 .hp-num{font-family:var(--mono);font-variant-numeric:tabular-nums;color:#CFF7FF;text-shadow:0 0 20px rgba(91,231,245,.32)}
 .hp-divider{height:1px;margin:9px 0;background:linear-gradient(90deg,rgba(91,231,245,.28),transparent)}
-.hud-top{display:grid;grid-template-columns:minmax(150px,190px) minmax(0,1fr) minmax(220px,280px);gap:12px;align-items:stretch;margin-bottom:12px}
-.hud-mid{display:grid;grid-template-columns:minmax(360px,1.34fr) minmax(0,.94fr) minmax(200px,.70fr);gap:12px;align-items:stretch;margin-bottom:12px}
+.hud-top{display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr) minmax(0,300px);gap:12px;align-items:stretch;margin-bottom:12px}
+.hud-mid{display:grid;grid-template-columns:minmax(0,1.34fr) minmax(0,.94fr) minmax(0,.70fr);gap:12px;align-items:stretch;margin-bottom:12px}
 .hud-bottom{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}
 .ht-right{display:grid;grid-template-columns:96px minmax(0,1fr);gap:10px;align-items:start}
 .hm-right{display:flex;flex-direction:column;gap:10px}
@@ -867,6 +867,7 @@ select.input{background-color:rgba(3,12,24,.72)}
 .vert-rail i.on{background:linear-gradient(90deg,#2E7FB8,#7BF0FF);box-shadow:0 0 8px rgba(91,231,245,.4)}
 .compass{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:8px;font:500 11px/1 var(--mono);color:#9FE9F5}
 .compass span{display:grid;place-items:center;width:22px;height:22px;border:1px solid rgba(91,231,245,.4);border-radius:50%}
+
 
 @media (max-width:1250px){
   .hud-top{grid-template-columns:minmax(140px,180px) minmax(0,1fr)}
@@ -1129,7 +1130,7 @@ select.input{background-color:rgba(3,12,24,.72)}
 
 /* ===== 联动版：缩小地球 / 精简底部 / 全站聚焦态 ===== */
 /* 地球缩小后中部整行降高，右侧两列不再被拉出空白 */
-.hud .hud-mid{grid-template-columns:2.65fr 3.35fr 3.4fr}
+.hud .hud-mid{grid-template-columns:minmax(0,.95fr) minmax(0,1.35fr) minmax(0,1.15fr)}
 .hud .map-canvas{max-width:330px}
 .hud .hud-bottom{grid-template-columns:2.3fr 4.1fr 1.7fr 2.3fr}
 .hud .hud-bottom::before{display:none}
@@ -1447,6 +1448,22 @@ select.input{background-color:rgba(3,12,24,.72)}
   .hd-red{top:55px;width:calc(var(--hd-plate) - 18px);height:1.5px}
   .hd-rail{top:40px}
   .hd-tools{display:none}
+}
+
+/* ===== 宽屏填充（≥1700）：不再把内容锁在 1460 里留两片空白 ===== */
+@media (min-width:1700px){
+  /* 顶排原本第二列是空的（只给中置铭牌让位），宽屏下就是一个大洞，直接填掉 */
+  .hud .hud-top{grid-template-columns:minmax(0,210px) minmax(0,1.15fr) minmax(0,1.3fr)}
+  .hud .hud-top > :nth-child(1){grid-column:1}
+  .hud .hud-top > :nth-child(2){grid-column:2}
+  .hud .hud-top > :nth-child(3){grid-column:3}
+  /* 中排：地球列按内容封顶，多余宽度给判定/处置与右侧三块 */
+  .hud .hud-mid{grid-template-columns:minmax(0,1fr) minmax(0,1.5fr) minmax(0,1.28fr)}
+  .hud .map-canvas{max-width:min(100%,540px)}
+  /* 准星卡在宽列里别缩成一小块居中 */
+  .hud .sh-track .reticle-info{max-width:min(100%,470px)}
+  /* 底排四块按内容量重新配比 */
+  .hud .hud-bottom{grid-template-columns:minmax(0,2fr) minmax(0,4.2fr) minmax(0,1.8fr) minmax(0,2.2fr)}
 }
 </style>
 </head>
