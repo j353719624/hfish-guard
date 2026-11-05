@@ -1318,6 +1318,7 @@ select.input{background-color:rgba(3,12,24,.72)}
   cursor:nwse-resize;touch-action:none;border-right:2px solid #5BE7F5;border-bottom:2px solid #5BE7F5;
   background:linear-gradient(135deg,transparent 44%,rgba(91,231,245,.9) 45% 54%,transparent 55%),
              linear-gradient(135deg,transparent 66%,rgba(91,231,245,.6) 67% 76%,transparent 77%)}
+.act--blue{color:#A9CBFF}
 .hud.is-editing .tile-resize{display:block}
 @media (prefers-reduced-motion:reduce){.tile-grip,.tile-resize{transition:none}}
 
@@ -2074,6 +2075,31 @@ select.input{background-color:rgba(3,12,24,.72)}
             </div>
           </div>
           <div class="panel mt-16">
+            <div class="section-label">HFish 联动 · 官方出口（可选，不启用也能只用内核计数）</div>
+            <div class="panel-body">
+              <div class="form-grid form-grid--3">
+                <div class="field"><label class="field-label" for="cfgHfishEnabled">事件接入</label>
+                  <select class="input" id="cfgHfishEnabled"><option value="0">关闭</option><option value="1">开启（接收 syslog / webhook）</option></select>
+                  <div class="hint">开启后监听下方 syslog 端口，端口变更需重启守护</div></div>
+                <div class="field"><label class="field-label" for="cfgHfishSyslog">syslog 端口</label>
+                  <input class="input mono" id="cfgHfishSyslog" type="number" min="1" max="65535">
+                  <div class="hint">HFish「告警策略 → syslog」指向本机该端口（UDP/TCP）</div></div>
+                <div class="field"><label class="field-label" for="cfgHfishLevel">按告警等级自动封禁</label>
+                  <select class="input" id="cfgHfishLevel"><option value="">不自动封禁</option><option value="high">high 及以上</option><option value="critical">critical</option></select>
+                  <div class="hint">仅封禁模式生效，沿用上方黑名单 TTL</div></div>
+              </div>
+              <div class="form-grid mt-16" style="padding:0">
+                <div class="field"><label class="field-label" for="cfgHfishApi">开放 API 地址</label>
+                  <input class="input mono" id="cfgHfishApi" placeholder="https://127.0.0.1:4433" autocomplete="off">
+                  <div class="hint">HFish 管理端地址；留空则只收 syslog/webhook</div></div>
+                <div class="field"><label class="field-label" for="cfgHfishKey">API Key</label>
+                  <input class="input mono" id="cfgHfishKey" type="password" autocomplete="off" placeholder="HFish 系统设置 → API 配置">
+                  <div class="hint">只做情报补充（攻击来源/标签），不参与阈值判定</div></div>
+              </div>
+              <div class="hint" id="cfgHfishHint" style="margin-top:10px">—</div>
+            </div>
+          </div>
+          <div class="panel mt-16">
             <div class="section-label">接口鉴权</div>
             <div class="panel-body" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
               <div class="token-box" style="flex:1"><svg class="icon" aria-hidden="true" style="color:var(--t3)"><use href="#i-shield"/></svg><code id="cfgToken">hfish-guard-demo</code></div>
@@ -2092,6 +2118,8 @@ select.input{background-color:rgba(3,12,24,.72)}
               <li><code>GET /api/blacklist</code> · <code>POST /api/blacklist</code> · <code>DELETE /api/blacklist/{ip}</code></li>
               <li><code>GET /api/whitelist</code> · <code>POST /api/whitelist</code> · <code>DELETE /api/whitelist/{cidr}</code></li>
               <li><code>GET /api/config</code> · <code>PUT /api/config</code> — 热加载配置</li>
+              <li><code>POST /api/hfish/webhook?k=</code> — 接收 HFish 自定义 webhook 告警</li>
+              <li><code>GET /api/hfish/intel</code> — HFish 开放 API 拉取的攻击来源情报</li>
               <li><code>GET /api/geo?ip=</code> — 由 GeoIP（MaxMind / QQWry）返回 <code>cc / city / lat / lon / org</code>；事件与黑白名单响应体携带 <code>geo</code> 字段，接口面只做展示，当前原型使用离线演示字典</li>
               <li>所有请求头携带 <code>Authorization: Bearer &lt;token&gt;</code></li>
             </ul></details>
@@ -2188,7 +2216,7 @@ var TARGETS=[
 
 var state={
   view:'map',authed:false,mode:'observe',threshold:40,windowSec:60,pollSec:10,ttlSec:3600,
-  token:'hfish-guard-demo',
+  token:'hfish-guard-demo',hfish:null,hfishLink:null,hfishConfigured:false,
   ports:[6379,9200,2022,7878,3306,8080,445],
   eventFilter:'all',eventQuery:'',eventPage:1,pageSize:10,
   packets:[],totalPackets:12840,topSrcPackets:62,lastReload:T0-17*60*1000,lastPollAt:T0-3000,
@@ -2212,9 +2240,19 @@ for(var j=0;j<32;j++){
   var pk=vd==='over'?(40+Math.floor(rnd()*220)):(vd==='normal'?(1+Math.floor(rnd()*32)):Math.floor(rnd()*80));
   state.events.push({id:'EV-'+(2100+j),ts:T0-j*1000*(40+Math.floor(rnd()*180)),ip:src,port:port,packets:pk,verdict:vd});
 }
-function sumPackets(){return state.packets.reduce(function(a,b){return a+b;},0);}
+function sumPackets(){
+  /* 连后端时「窗口内包数」以守护进程的滑动窗口为准，而不是本地图表点之和 */
+  if(window.HG_LIVE&&HG_LIVE.live&&typeof state.windowSum==='number')return state.windowSum;
+  return state.packets.reduce(function(a,b){return a+b;},0);
+}
 function actionOf(e){
   if(e.verdict==='exempt')return {label:'白名单豁免',cls:'green'};
+  if(e.verdict==='hfish'){
+    var blocked=(e.action||'').indexOf('封禁')>=0;
+    return {label:blocked?'已封禁':'蜜罐告警',cls:blocked?'red':'blue'};
+  }
+  if(e.verdict==='manual')return {label:'手动封禁',cls:'red'};
+  if(e.verdict==='expired')return {label:'TTL 到期解封',cls:'muted'};
   if(e.verdict==='normal')return {label:'仅计包',cls:'muted'};
   if(state.mode==='enforce')return {label:'已封禁',cls:'red'};
   return {label:'仅记录（观察）',cls:'amber'};
@@ -2222,6 +2260,9 @@ function actionOf(e){
 function verdictTag(v){
   if(v==='over')return '<span class="tag tag--amber">超过阈值</span>';
   if(v==='exempt')return '<span class="tag tag--green">命中白名单</span>';
+  if(v==='hfish')return '<span class="tag tag--blue">蜜罐告警</span>';
+  if(v==='manual')return '<span class="tag tag--blue">手动处置</span>';
+  if(v==='expired')return '<span class="tag tag--muted">已解封</span>';
   return '<span class="tag tag--muted">未达阈值</span>';
 }
 function toast(msg,type){
@@ -2383,8 +2424,27 @@ function fillConfig(){
     $('#'+(r.value==='observe'?'rcObserve':'rcEnforce')).classList.toggle('is-on',on);
   });
   renderPortChips();
+  var hf=state.hfish||{};
+  if($('#cfgHfishEnabled'))$('#cfgHfishEnabled').value=hf.enabled?'1':'0';
+  if($('#cfgHfishSyslog'))$('#cfgHfishSyslog').value=hf.syslog_port||5514;
+  if($('#cfgHfishLevel'))$('#cfgHfishLevel').value=hf.auto_block_level||'';
+  if($('#cfgHfishApi'))$('#cfgHfishApi').value=hf.api_base||'';
+  if($('#cfgHfishKey'))$('#cfgHfishKey').value=hf.api_key||'';
+  renderHfishHint();
   ['cfgThresholdErr','cfgWindowErr','cfgPollErr','cfgTtlErr','portErr'].forEach(function(id){$('#'+id).textContent='';});
   state.cfgDirty=false;
+}
+function renderHfishHint(){
+  var el=$('#cfgHfishHint');if(!el)return;
+  if(!(window.HG_LIVE&&HG_LIVE.live)){el.textContent='演示模式：以下设置仅在连接 guard.py 后生效';return;}
+  var l=state.hfishLink;
+  if(!l){el.textContent='—';return;}
+  var rec=l.received||{};
+  var bound=l.syslog_bound||{};
+  var listen=(bound.udp||bound.tcp)?('监听 :'+l.syslog_port+'（'+[bound.udp?'UDP':'',bound.tcp?'TCP':''].filter(Boolean).join('/')+'）'):'未监听';
+  el.textContent='当前：'+(l.enabled?'事件接入已开启':'事件接入未开启')+' · syslog '+listen+
+    ' · 已收 '+(rec.syslog||0)+' 条 syslog / '+(rec.webhook||0)+' 条 webhook'+
+    ' · 开放 API '+(l.api_configured?(l.api_ok?'正常（情报 '+l.intel_count+' 条）':('异常 '+(l.api_error||''))):'未配置');
 }
 function renderGlobe(){
   var seen={},n=0;
@@ -2778,6 +2838,7 @@ function addWhitelist(cidr,note,silent){
   if(state.whitelist.some(function(w){return w.cidr===cidr;}))return 'exists';
   state.whitelist.unshift({cidr:cidr,note:note||'',at:Date.now()});
   renderWhitelist();renderStatus();
+  if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('wl-add',{cidr:cidr,note:note||''});
   if(!silent)toast('已添加并即时同步：'+cidr,'ok');
   return true;
 }
@@ -2786,6 +2847,7 @@ function addBlacklist(ip,ttl,note,silent){
   if(state.blacklist.some(function(b){return b.ip===ip;}))return 'exists';
   state.blacklist.unshift({ip:ip,port:state.ports[0],packets:state.threshold+1,at:Date.now(),ttl:ttl||state.ttlSec,note:note||'手动封禁'});
   renderBlacklist();renderStatus();renderEvents();
+  if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('bl-add',{ip:ip,ttl:ttl||state.ttlSec,port:state.ports[0],reason:note||'手动封禁'});
   if(!silent)toast('已封禁 '+ip+' · 全端口 DROP','warn');
   return true;
 }
@@ -2815,6 +2877,7 @@ $('#fillDemo').addEventListener('click',function(){$('#tokenInput').value='hfish
 $('#gateForm').addEventListener('submit',function(e){
   e.preventDefault();
   var v=$('#tokenInput').value.trim();
+  if(window.HG_LIVE&&HG_LIVE.detected){HG_LIVE.login(v);return;}
   if(v!==state.token){
     $('#gateError').textContent='凭证无效，请检查后重试。';
     $('#tokenInput').setAttribute('aria-invalid','true');
@@ -2823,7 +2886,7 @@ $('#gateForm').addEventListener('submit',function(e){
   $('#gateError').textContent='';$('#tokenInput').removeAttribute('aria-invalid');
   $('#gate').hidden=true;$('#app').hidden=false;state.authed=true;
   setView('map');renderAll();updateClock();
-  toast('凭证校验通过 · 已连接 :9705','ok');
+  toast('凭证校验通过 · 演示数据模式','ok');
 });
 $$('[data-nav]').forEach(function(b){b.addEventListener('click',function(){setView(b.dataset.nav);});});
 $$('[data-mode]').forEach(function(b){b.addEventListener('click',function(){
@@ -2934,13 +2997,17 @@ document.addEventListener('click',function(e){
   if(wl){
     var c=wl.dataset.wl;
     state.whitelist=state.whitelist.filter(function(w){return w.cidr!==c;});
-    renderWhitelist();renderStatus();toast('已移除豁免条目 '+c,'ok');return;
+    renderWhitelist();renderStatus();
+    if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('wl-del',{cidr:c});
+    toast('已移除豁免条目 '+c,'ok');return;
   }
   var bl=t.closest('[data-bl]');
   if(bl){
     var ip=bl.dataset.bl;
     state.blacklist=state.blacklist.filter(function(b){return b.ip!==ip;});
-    renderBlacklist();renderStatus();toast('已解封 '+ip,'ok');return;
+    renderBlacklist();renderStatus();
+    if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('unblock',{ip:ip});
+    toast('已解封 '+ip,'ok');return;
   }
   var pr=t.closest('[data-port-remove]');
   if(pr){
@@ -2952,7 +3019,7 @@ document.addEventListener('click',function(e){
   var act=t.closest('[data-action]');
   if(!act)return;
   var a=act.dataset.action;
-  if(a==='refresh'){renderAll();toast('状态已刷新','ok');}
+  if(a==='refresh'){if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.sync(true);else{renderAll();toast('状态已刷新','ok');}}
   if(a==='export')exportCsv();
   if(a==='drawer-close')closeDrawer();
   if(a==='event-ban'&&state.activeEvent){
@@ -2969,6 +3036,7 @@ document.addEventListener('click',function(e){
   }
   if(a==='copy-token')copyText(state.token,'凭证已复制到剪贴板');
   if(a==='regen-token'){
+    if(window.HG_LIVE&&HG_LIVE.live){HG_LIVE.push('regen',{});return;}
     state.token='hg-'+Math.random().toString(16).slice(2,10)+Math.random().toString(16).slice(2,10);
     $('#cfgToken').textContent=state.token;
     toast('新凭证已生成 · 下次登录需使用新凭证','warn');
@@ -3007,10 +3075,19 @@ $('#cfgForm').addEventListener('submit',function(e){
   state.pollSec=Number($('#cfgPoll').value);
   state.ttlSec=Number($('#cfgTtl').value);
   state.mode=$('input[name="cfgMode"]:checked').value;
+  var hfNew={
+    enabled:$('#cfgHfishEnabled').value==='1',
+    syslog_port:Number($('#cfgHfishSyslog').value)||5514,
+    auto_block_level:$('#cfgHfishLevel').value,
+    api_base:$('#cfgHfishApi').value.trim(),
+    api_key:$('#cfgHfishKey').value.trim()
+  };
+  state.hfish=hfNew;
   $$('[data-mode]').forEach(function(x){var on=x.dataset.mode===state.mode;x.classList.toggle('is-on',on);x.setAttribute('aria-pressed',String(on));});
   var banner=$('#modeBanner');banner.classList.toggle('is-enforce',state.mode==='enforce');
   banner.querySelector('span').textContent=state.mode==='enforce'?'封禁模式 · 超阈值源 IP 将写入黑名单并全端口 DROP':'观察模式 · 超阈值仅记录事件，不下发封禁（最安全默认值）';
   state.lastReload=Date.now();state.cfgDirty=false;
+  if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('config',{mode:state.mode,threshold:state.threshold,window:state.windowSec,poll:state.pollSec,ttl:state.ttlSec,ports:state.ports,hfish:state.hfish});
   renderAll();toast('配置已热加载 · 无需重启 guard.service','ok');
 });
 function updateClock(){
@@ -3020,8 +3097,10 @@ function updateClock(){
 }
 function tick(){
   var now=Date.now();updateClock();
-  if((now-state.lastPollAt)/1000>=state.pollSec)state.lastPollAt=now;
   if(!state.authed)return;
+  /* 连着真后端时不做本地造数，只按守护进程节奏拉取 */
+  if(window.HG_LIVE&&HG_LIVE.live){HG_LIVE.tick();return;}
+  if((now-state.lastPollAt)/1000>=state.pollSec)state.lastPollAt=now;
   var v=Math.floor(rnd()*6);if(rnd()>0.94)v+=Math.floor(rnd()*10);
   state.packets.push(v);if(state.packets.length>60)state.packets.shift();
   state.totalPackets+=v;
@@ -3355,130 +3434,295 @@ window.HG_LAYOUT={
     ensureCanvas(t);updateLabel(t);storeFromEl(t);saveLayout();return true;
   }
 };
+/* ==================================================================
+   API 桥接层 · guard.py :9705
+   设计稿本身是纯前端原型（state 里是内置演示数据）。这一层只做「数据源
+   替换」：能连上守护进程就用真实数据 + 真实写操作，连不上就保持演示
+   数据不动，所以同一个文件既能当设计稿预览，也能直接部署到 NAS 上。
+   ================================================================== */
+var HG_LIVE=(function(){
+  var TOKEN_KEY='hg-token';
+  var detected=false,live=false,token='',syncing=false,lastSync=0,fails=0,
+      geoAsked={},inited=false;
+
+  function qs(name){
+    var m=new RegExp('[?&]'+name+'=([^&#]*)').exec(location.search||'');
+    return m?decodeURIComponent(m[1].replace(/\+/g,' ')):'';
+  }
+  function req(path,opt){
+    opt=opt||{};
+    var headers={'Accept':'application/json'};
+    if(opt.auth!==false&&token)headers['Authorization']='Bearer '+token;
+    var init={method:opt.method||'GET',headers:headers,cache:'no-store'};
+    if(opt.body!==undefined){headers['Content-Type']='application/json';init.body=JSON.stringify(opt.body);}
+    return fetch(path,init).then(function(r){
+      if(r.status===401)throw {code:401,message:'凭证无效'};
+      if(!r.ok){
+        return r.json().catch(function(){return{};}).then(function(j){
+          throw {code:r.status,message:j.error||('HTTP '+r.status)};
+        });
+      }
+      return r.json();
+    });
+  }
+  function gateErr(msg){
+    var el=$('#gateError');if(el)el.textContent=msg||'';
+    var i=$('#tokenInput');if(i&&msg)i.setAttribute('aria-invalid','true');
+  }
+
+  /* 顶栏右上角的连接指示（兼作「断开连接」按钮） */
+  function badge(){
+    var tools=document.querySelector('.hd-tools');if(!tools)return;
+    var el=document.getElementById('hgLive');
+    if(!el){
+      el=document.createElement('span');
+      el.id='hgLive';
+      el.style.cssText='display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;'+
+        'font:500 10.5px/1 var(--mono);letter-spacing:.1em;border:1px solid;cursor:pointer;'+
+        'user-select:none;white-space:nowrap';
+      el.addEventListener('click',function(){
+        if(live){logout('已断开，请重新输入凭证');}
+        else if(detected){var i=$('#tokenInput');if(i)i.focus();}
+      });
+      tools.insertBefore(el,tools.firstChild);
+    }
+    el.textContent=live?('LIVE :'+(location.port||'80')):'DEMO';
+    el.title=live?'已连接 guard.py · 点击断开':'未连接后端，当前为演示数据';
+    el.style.color=live?'#7DF3C4':'#F2C078';
+    el.style.borderColor=live?'rgba(125,243,196,.5)':'rgba(242,192,120,.45)';
+    el.style.background=live?'rgba(32,120,90,.2)':'rgba(120,90,32,.2)';
+  }
+
+  function onDetected(h){
+    detected=true;
+    var foot=document.querySelector('.gate-foot');
+    if(foot){
+      foot.innerHTML='<span>凭证见应用「配置」页</span>'+
+        '<button type="button" class="gate-demo" id="hgDemoIn" title="不连接后端，用内置演示数据预览界面">以演示数据预览</button>';
+      var b=$('#hgDemoIn');
+      if(b)b.addEventListener('click',enterDemo);
+    }
+    var ver=document.querySelector('.topbar-brand .ver');
+    if(ver&&h&&h.version)ver.textContent='v'+h.version;
+    var sub=document.querySelector('.gate-sub');
+    if(sub)sub.textContent='已连接本机 guard.py 守护进程。请输入安装时生成的接口 Token，凭证仅保存在本次会话。';
+    badge();
+  }
+
+  function enterDemo(){
+    state.authed=true;
+    $('#gate').hidden=true;$('#app').hidden=false;
+    setView('map');renderAll();updateClock();badge();
+    toast('演示模式 · 未连接守护进程 :9705','warn');
+  }
+
+  function login(t){
+    t=(t||'').trim();
+    if(!t){gateErr('请输入访问凭证');return;}
+    token=t;
+    req('/api/status').then(function(){enter(t);}).catch(function(e){
+      token='';
+      if(e&&e.code===401)gateErr('凭证无效，请检查是否与安装时生成的一致');
+      else gateErr('无法连接守护进程：'+((e&&e.message)||'网络错误'));
+    });
+  }
+
+  function enter(t,quiet){
+    if(live)return;
+    live=true;state.authed=true;state.live=true;state.token=t;
+    try{sessionStorage.setItem(TOKEN_KEY,t);}catch(e){}
+    var tk=$('#cfgToken');if(tk)tk.textContent=t;
+    var i=$('#tokenInput');if(i)i.removeAttribute('aria-invalid');
+    gateErr('');
+    $('#gate').hidden=true;$('#app').hidden=false;
+    var h=(location.hash||'').replace('#/','');
+    setView(VIEWS.indexOf(h)>=0?h:'map');
+    badge();
+    sync(true).then(function(){if(!quiet)toast('已连接守护进程 · 实时数据','ok');});
+  }
+
+  function logout(msg){
+    live=false;token='';state.live=false;
+    try{sessionStorage.removeItem(TOKEN_KEY);}catch(e){}
+    $('#app').hidden=true;$('#gate').hidden=false;
+    badge();gateErr(msg||'会话已结束');
+    var i=$('#tokenInput');if(i){i.value='';i.focus();}
+  }
+
+  /* ---------- 数据映射 ---------- */
+  function padSeries(series){
+    var vals=(series||[]).map(function(x){
+      return Array.isArray(x)?Number(x[1])||0:Number(x)||0;
+    });
+    while(vals.length<60)vals.unshift(0);
+    return vals.slice(-60);
+  }
+  function mapEvents(rows){
+    return (rows||[]).map(function(r){
+      var v=r.verdict==='over'?'over':(r.verdict==='manual'?'manual':
+        (r.verdict==='expired'?'expired':(r.verdict==='hfish'?'hfish':'normal')));
+      return {id:r.id,ts:r.ts,ip:r.ip,port:r.port,packets:r.packets,verdict:v,
+              action:r.action,detail:r.detail||''};
+    });
+  }
+  function mapBlocks(rows){
+    return (rows||[]).map(function(b){
+      return {ip:b.ip,port:b.port||0,packets:b.packets||0,at:b.at,
+              ttl:b.ttl||3600,note:b.reason||'',permanent:!!b.permanent};
+    });
+  }
+  function mapWl(rows){
+    return (rows||[]).map(function(w){
+      return {cidr:w.cidr,note:w.note||'',at:(w.at||0)*1000};
+    });
+  }
+
+  /* 把后端 geo 补进前端的 GEO 字典，地球仪才有真实落点 */
+  function geoWarm(){
+    var list=[],seen={};
+    state.events.forEach(function(e){
+      if(!e.ip||GEO[e.ip]||PRIVATE_RE.test(e.ip)||seen[e.ip]||geoAsked[e.ip])return;
+      seen[e.ip]=1;list.push(e.ip);
+    });
+    if(!list.length)return;
+    var batch=list.slice(0,60),changed=false;
+    batch.forEach(function(ip){geoAsked[ip]=1;});
+    req('/api/geo?ips='+encodeURIComponent(batch.join(','))).then(function(res){
+      (res.items||[]).forEach(function(g){
+        if(!g||g.lat===null||g.lat===undefined)return;
+        GEO[g.ip]={cc:g.cc||'--',cn:g.cn||'未知',city:g.city||'-',lat:g.lat,lon:g.lon,
+                   org:g.org||'-',risk:'mid',approx:g.source!=='mmdb'};
+        changed=true;
+      });
+      if(changed)renderAll();
+    }).catch(function(){});
+  }
+
+  function apply(st,evs,bl,wl,cfg){
+    state.mode=st.mode||state.mode;
+    state.threshold=st.threshold||state.threshold;
+    state.windowSec=st.window||state.windowSec;
+    state.pollSec=st.poll||state.pollSec;
+    state.ttlSec=st.ttl===undefined?state.ttlSec:st.ttl;
+    if(st.ports&&st.ports.length)state.ports=st.ports.map(Number);
+    state.packets=padSeries(st.window_series);
+    state.totalPackets=st.total_packets||0;
+    state.topSrcPackets=st.top_src||0;
+    state.windowSum=st.window_sum||0;
+    state.events=mapEvents(evs);
+    state.blacklist=mapBlocks(bl);
+    state.whitelist=mapWl(wl);
+    state.trap=!!st.trap;
+    state.kernelInfo=st.kernel||null;
+    state.link=st.link||null;
+    state.geoSource=st.geo_source||'';
+    state.portState=st.port_state||[];
+    state.hfishLink=(st.link||{}).hfish||null;
+    if(cfg&&cfg.hfish){
+      state.hfish=cfg.hfish;
+      state.hfishConfigured=!!cfg.hfish.enabled;
+      if(cfg.token)state.token=cfg.token;
+    }
+    state.lastSync=Date.now();
+    state.lastPollAt=state.lastSync;
+    state.lastReload=state.lastSync-(st.uptime||0)*1000;
+    geoWarm();
+    renderAll();
+    var max=$('#chartMax');
+    if(max&&max.textContent.indexOf('包/s')>=0)max.textContent=max.textContent.replace('包/s','包/'+state.pollSec+'s');
+    if(state.view==='config'&&!state.cfgDirty)fillConfig();
+  }
+
+  function sync(force){
+    if(!live||syncing)return Promise.resolve();
+    if(!force&&Date.now()-lastSync<Math.max(2,state.pollSec)*1000)return Promise.resolve();
+    syncing=true;
+    return Promise.all([
+      req('/api/status'),
+      req('/api/events?limit=200'),
+      req('/api/blacklist'),
+      req('/api/whitelist'),
+      req('/api/config')
+    ]).then(function(r){
+      apply(r[0],r[1],r[2],r[3],r[4]);lastSync=Date.now();fails=0;
+    }).catch(function(e){
+      fails++;
+      if(e&&e.code===401){logout('凭证已失效，请重新输入');return;}
+      if(fails===3)toast('与守护进程的连接中断，正在重试','warn');
+    }).then(function(){syncing=false;});
+  }
+
+  /* ---------- 写操作：本地已乐观更新，这里只负责落到后端 ---------- */
+  function push(kind,p){
+    if(!live)return;
+    var path='/api/'+kind,opt={method:'POST',body:p||{}};
+    if(kind==='wl-add'){path='/api/whitelist';}
+    else if(kind==='bl-add'){path='/api/blacklist';}
+    else if(kind==='unblock'){path='/api/blacklist/delete';}
+    else if(kind==='wl-del'){path='/api/whitelist/delete';}
+    else if(kind==='config'){path='/api/config';opt.method='PUT';}
+    else if(kind==='regen'){path='/api/token';}
+    req(path,opt).then(function(res){
+      if(kind==='regen'&&res&&res.token){
+        token=res.token;state.token=res.token;
+        try{sessionStorage.setItem(TOKEN_KEY,res.token);}catch(e){}
+        var el=$('#cfgToken');if(el)el.textContent=res.token;
+        toast('新凭证已生效 · 其他会话需重新登录','warn');
+      }
+      setTimeout(function(){sync(true);},260);
+    }).catch(function(e){
+      toast('操作失败：'+((e&&e.message)||'接口不可用'),'err');
+      sync(true);
+    });
+  }
+
+  function tick(){
+    if(!live)return;
+    var pb=$('#globePhaseBar');
+    if(pb)pb.style.width=Math.min(100,Math.round((Date.now()-lastSync)/1000/Math.max(1,state.pollSec)*100))+'%';
+    if(Date.now()-lastSync>=Math.max(2,state.pollSec)*1000)sync(false);
+    if(state.view==='blacklist')renderBlacklist();
+  }
+
+  function boot(){
+    if(inited)return;
+    inited=true;
+    var qt=qs('token');
+    req('/api/health',{auth:false}).then(function(h){
+      if(h&&h.ok)onDetected(h);
+    }).catch(function(){}).then(function(){
+      if(qt){
+        if(history.replaceState)history.replaceState(null,'',location.pathname+location.hash);
+        login(qt);return;
+      }
+      var saved='';
+      try{saved=sessionStorage.getItem(TOKEN_KEY)||'';}catch(e){}
+      if(detected&&saved){
+        token=saved;
+        req('/api/status').then(function(){enter(saved,true);}).catch(function(){
+          token='';try{sessionStorage.removeItem(TOKEN_KEY);}catch(e){}
+          badge();
+        });
+      }
+    });
+  }
+
+  return {boot:boot,login:login,push:push,sync:sync,tick:tick,
+          logout:logout,demo:enterDemo,
+          get detected(){return detected;},get live(){return live;}};
+})();
+window.HG_LIVE=HG_LIVE;
+
 renderAll();fillConfig();updateClock();setInterval(tick,1000);
-if(location.search.indexOf('selftest')>=0){setTimeout(runSelfTest,220);}
-else if(location.search.indexOf('demo')>=0){
+/* 注意：不能用 indexOf('demo') —— 默认演示凭证 hfish-guard-demo 里就含 demo */
+if(/[?&]selftest(=|&|$)/.test(location.search)){setTimeout(runSelfTest,220);}
+else if(/[?&]demo(=|&|$)/.test(location.search)){
   $('#gate').hidden=true;$('#app').hidden=false;state.authed=true;
   var dm=/[?&]demo=([^&#]*)/.exec(location.search);
   setView(dm&&dm[1]?dm[1]:'map');renderAll();updateClock();
 }
+else{HG_LIVE.boot();}
 })();
 </script>
-/* ============================================================
-   API BRIDGE · 真实后端对接层
-   在设计稿的演示数据之上，注入 guard.py 守护进程的真实数据。
-   原则：设计稿的渲染/交互逻辑零改动；此层只做「数据源替换」。
-   ============================================================ */
-(function(){
-'use strict';
-/* 守护进程地址与当前 token（gate 校验通过后写入） */
-var API_TOKEN=sessionStorage.getItem('hg-token')||'';
-var LIVE=false;
-
-/* 把后端 events 行映射为设计稿的 state.events 行 */
-function mapEvents(rows){
-  return (rows||[]).map(function(r,i){
-    return {id:'EV-'+(r.id||i),ts:(r.ts||0)*1000,ip:r.ip||'',port:r.port||0,
-      packets:r.packets||0,
-      verdict:r.verdict==='over'?'over':r.verdict==='manual'?'normal':
-        r.verdict==='expired'?'expired':'normal'};
-  });
-}
-/* 把后端 blocks 行映射为设计稿的 state.blacklist 行 */
-function mapBlocks(rows){
-  return (rows||[]).map(function(r){
-    var left=Math.max(0,(r.expire||0)-Math.floor(Date.now()/1000));
-    return {ip:r.ip,port:r.port||0,packets:r.packets||0,
-      at:(r.ts||0)*1000,ttl:Math.max(60,r.ttl||3600),note:r.reason||''};
-  });
-}
-/* 把后端 whitelist 行映射为设计稿的 state.whitelist 行 */
-function mapWhitelist(rows){
-  return (rows||[]).map(function(w){
-    return {cidr:w.cidr||w,note:w.note||'',at:(w.at||0)*1000};
-  });
-}
-
-/* 拉取全部真实数据并覆盖 state（渲染由设计稿自身完成） */
-function syncAll(){
-  if(!API_TOKEN)return;
-  fetch('/api/status',{headers:{'Authorization':'Bearer '+API_TOKEN}}).then(function(r){
-    if(!r.ok)throw new Error('status '+r.status);
-    return r.json();
-  }).then(function(s){
-    if(s.mode)state.mode=s.mode;
-    if(s.threshold!==undefined)state.threshold=s.threshold;
-    if(s.window!==undefined)state.windowSec=s.window;
-    if(s.poll!==undefined)state.pollSec=s.poll;
-    if(s.ttl!==undefined)state.ttlSec=s.ttl;
-    if(s.ports)state.ports=s.ports.map(Number);
-    if(s.whitelist)state.whitelist=mapWhitelist(s.whitelist);
-    state.trap=s.trap;
-    state.totalPackets=s.total_packets||0;
-    state.lastPollAt=(s.last_poll||0)*1000;
-    state.windowSeries=s.window||[];
-    if(s.recent){/* 状态总览最近事件 */}
-    return fetch('/api/events',{headers:{'Authorization':'Bearer '+API_TOKEN}});
-  }).then(function(r){return r.json();}).then(function(evs){
-    state.events=mapEvents(evs);
-    return fetch('/api/blacklist',{headers:{'Authorization':'Bearer '+API_TOKEN}});
-  }).then(function(r){return r.json();}).then(function(bl){
-    state.blacklist=mapBlocks(bl);
-    return fetch('/api/whitelist',{headers:{'Authorization':'Bearer '+API_TOKEN}});
-  }).then(function(r){return r.json();}).then(function(wl){
-    state.whitelist=mapWhitelist(wl);
-    renderAll();
-  }).catch(function(e){console.warn('apiSync',e);});
-}
-
-/* CRUD 同步到后端（设计稿的 addWhitelist/addBlacklist 仍负责 UI 更新） */
-var _origAddWl=addWhitelist,_origAddBl=addBlacklist;
-addWhitelist=function(cidr,note,silent){
-  var r=_origAddWl(cidr,note,silent);
-  if(r===true)fetch('/api/whitelist',{method:'POST',
-    headers:{'Authorization':'Bearer '+API_TOKEN,'Content-Type':'application/json'},
-    body:JSON.stringify({cidr:cidr,note:note||''})}).then(apiSync);
-  return r;
-};
-addBlacklist=function(ip,ttl,note,silent){
-  var r=_origAddBl(ip,ttl,note,silent);
-  if(r===true)fetch('/api/blacklist',{method:'POST',
-    headers:{'Authorization':'Bearer '+API_TOKEN,'Content-Type':'application/json'},
-    body:JSON.stringify({ip:ip,ttl:ttl||0,note:note||''})}).then(apiSync);
-  return r;
-};
-
-/* 拦截移除操作同步到后端 */
-document.addEventListener('click',function(e){
-  var wl=e.target.closest('[data-wl]');
-  if(wl){fetch('/api/whitelist/'+wl.dataset.wl,{method:'DELETE',
-    headers:{'Authorization':'Bearer '+API_TOKEN}}).then(apiSync);return;}
-  var bl=e.target.closest('[data-bl]');
-  if(bl){fetch('/api/blacklist/'+bl.dataset.bl,{method:'DELETE',
-    headers:{'Authorization':'Bearer '+API_TOKEN}}).then(apiSync);return;}
-},true); /* capture phase，先于设计稿自身的处理器 */
-
-/* 定时同步 */
-setInterval(syncAll,5000);
-
-/* gate 校验：改走后端真实 token 验证 */
-var _origGate=$('#gateForm').addEventListener;
-$('#gateForm').addEventListener('submit',function(e){
-  e.preventDefault();e.stopImmediatePropagation();
-  var v=$('#tokenInput').value.trim();
-  fetch('/api/status',{headers:{'Authorization':'Bearer '+v}}).then(function(r){
-    if(!r.ok)throw new Error('auth');
-    API_TOKEN=v;sessionStorage.setItem('hg-token',v);
-    $('#gateError').textContent='';$('#tokenInput').removeAttribute('aria-invalid');
-    $('#gate').hidden=true;$('#app').hidden=false;state.authed=true;
-    setView('map');syncAll();updateClock();
-    toast('凭证校验通过 · 已连接 :9705','ok');
-  }).catch(function(){
-    $('#gateError').textContent='凭证无效，请检查后重试。';
-    $('#tokenInput').setAttribute('aria-invalid','true');
-  });
-},true); /* capture phase */
-})();
-
 </body>
 </html>

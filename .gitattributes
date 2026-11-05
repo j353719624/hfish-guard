@@ -1,0 +1,6 @@
+# fnOS 里 cmd/ 下的脚本靠 shebang 执行，CRLF 会报 bad interpreter；强制 LF
+fpk/cmd/* text eol=lf
+fpk/app/bin/*.py text eol=lf
+fpk/app/ui/config text eol=lf
+fpk/manifest text eol=lf
+scripts/*.sh text eol=lf

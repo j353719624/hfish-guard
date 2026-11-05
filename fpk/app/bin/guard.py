@@ -1,72 +1,398 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""蜜罐守卫 HFish Guard v1.1 —— 蜜罐联动自动封禁守护进程
+"""蜜罐守卫 HFish Guard · 守护进程 v1.2.0
 
-数据面：每个蜜罐端口一条 iptables 陷阱，命中包按 (IP, 端口) 记入独立
-        ipset hfish_guard_seen_<端口>（hash:ip counters timeout 300），白名单内核侧豁免。
-控制面：守护轮询各 seen 集合的包计数增量，按 (IP, 端口) 滑动窗口汇总：
-        enforce 模式：超阈值源 IP 写入 hfish_guard_black + INPUT 全端口 DROP（TTL 自动过期）
-        observe 模式：仅记录事件（最安全默认值）
-接口面：:9705 REST API + 单页值守控制台
-存储面：/vol2/@appdata/hfish-guard/{config.json, guard.db}
+四层结构（与 README / docs/ARCHITECTURE.md 对应）：
+
+  数据面  每个监视端口一条 iptables 陷阱规则，命中的源 IP 记入
+          ipset hfish_guard_seen_<port>（hash:ip counters timeout 300）。
+          白名单在**内核侧**用 `! --match-set hfish_guard_white src` 豁免，
+          自家扫描流量不会进入计数，也不会产生日志洪水。
+  控制面  每 poll 秒轮询各 seen 集合的 packets 计数，取增量；
+          按 (源IP, 端口) 做滑动窗口汇总，超阈值触发判定：
+              enforce 模式 → 写 hfish_guard_black + INPUT DROP（TTL 到期自动解封）
+              observe 模式 → 只记录事件（默认，最安全）
+  接口面  :9705 REST API（Bearer / ?token= 鉴权）+ 单文件控制台 UI
+  存储面  $HFISH_GUARD_DATA（默认 /vol2/@appdata/hfish-guard）：
+          config.json（配置与凭证）、guard.db（事件/黑名单，sqlite3）
+
+本地联调（Windows / 无 root 的开发机）：
+    python guard.py --fake --port 9706 --data ./tmp
+  --fake 用内存态内核替代 ipset/iptables，并启动攻击模拟器，
+  整条判定链路（计数→窗口→阈值→封禁→TTL）与线上完全一致。
+
+注意：本进程只读 ipset 计数器，不调用 HFish / Cowrie 的 API 与数据库，
+蜜罐侧升级、重装、换端口都不影响守卫；端口面通过配置同步联动。
 """
+import argparse
+import ipaddress
 import json
 import os
 import re
 import secrets
+import signal
+import socket
 import sqlite3
+import ssl
 import subprocess
+import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "1.2.0"
+APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
 CFG_PATH = os.path.join(BASE_DIR, "config.json")
 DB_PATH = os.path.join(BASE_DIR, "guard.db")
+GEO_PATH = os.path.join(BASE_DIR, "geo.json")
 PORT = int(os.environ.get("HFISH_GUARD_PORT", "9705"))
+POLL_DEFAULT = int(os.environ.get("HFISH_GUARD_POLL", "10"))
+FAKE = os.environ.get("HFISH_GUARD_FAKE", "").strip().lower() in ("1", "true", "yes", "on")
+VERBOSE = os.environ.get("HFISH_GUARD_VERBOSE", "").strip().lower() in ("1", "true", "yes", "on")
+# fake 模式下是否启动攻击模拟器（跑单测时用 HFISH_GUARD_SIM=0 关掉，避免干扰断言）
+SIMULATE = os.environ.get("HFISH_GUARD_SIM", "1").strip().lower() not in ("0", "false", "no", "off")
 
-IPS = "/usr/sbin/ipset"
-IPT = "/usr/sbin/iptables"
+IPS = os.environ.get("HFISH_GUARD_IPSET", "/usr/sbin/ipset")
+IPT = os.environ.get("HFISH_GUARD_IPTABLES", "/usr/sbin/iptables")
 
+# fnOS 把应用解到 /vol2/@appcenter/<app>/bin，同时在 /var/apps/<app>/ 下挂符号链接
 UI_CANDIDATES = (
     "/var/apps/hfish-guard/ui",
     "/vol2/@appcenter/hfish-guard/ui",
     "/vol2/@appcenter/hfish-guard/bin/ui",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ui"),
 )
+# 蜜罐应用（fnos-hive）的安装位置，用于状态页展示联动情况；只做存在性判断
+HIVE_DIRS = ("/vol2/@appcenter/hive", "/var/apps/hive")
+
+SEEN_PREFIX = "hfish_guard_seen_"
+SET_WHITE = "hfish_guard_white"
+SET_BLACK = "hfish_guard_black"
+SEEN_TIMEOUT = 300                      # ipset 成员兜底过期时间（秒）
 
 DEFAULT_CONFIG = {
-    "mode": "observe",
-    "threshold": 40,
-    "window": 60,
-    "poll": 10,
-    "ttl": 3600,
+    "mode": "observe",                  # observe | enforce
+    "threshold": 40,                    # 窗口内命中包数阈值
+    "window": 60,                       # 窗口秒数
+    "poll": POLL_DEFAULT,               # 轮询间隔
+    "ttl": 3600,                        # 黑名单过期秒数，0 = 永久
     "ports": ["6379", "9200", "9000", "8080", "8081", "9198", "9080", "9092", "2022", "7878"],
     "whitelist": [],
-    "token": "hfish-guard-demo",
+    "token": "",                        # 空 = 首次启动自动生成
+    # HFish 联动（官方三种出口：开放 API / syslog / webhook），可全部留空只用内核计数
+    "hfish": {
+        "enabled": False,               # 总开关：开启后才监听 syslog / 接受 webhook
+        "syslog_port": 5514,            # HFish「告警策略 → syslog」指向本机此端口（UDP+TCP）
+        "api_base": "",                 # 形如 https://127.0.0.1:4433（HFish 管理端，自签证书）
+        "api_key": "",                  # HFish「系统设置 → API 配置」里生成的 key
+        "verify_tls": False,            # HFish 默认自签证书，保持 False
+        "webhook_token": "",            # 自定义 webhook 的校验串；空则要求主 token
+        "auto_block_level": "",         # "" 不自动封禁；high / critical 时按告警等级直接封禁
+    },
 }
 
+# 归属地：无 mmdb 时的粗粒度兜底表（与 UI 内置表一致，标注 approx）。
+# 生产环境请放置 GeoLite2-City.mmdb 或自建 geo.json，见 docs/ARCHITECTURE.md。
+GEO_APPROX = (
+    ("5.", "RU", "俄罗斯", "东欧段", 59.93, 30.34),
+    ("23.", "US", "美国", "北美段", 39.00, -98.00),
+    ("45.", "NL", "荷兰", "西欧段", 52.30, 4.90),
+    ("89.", "NL", "荷兰", "西欧段", 51.90, 4.50),
+    ("91.", "RU", "俄罗斯", "东欧段", 55.70, 37.60),
+    ("103.", "SG", "新加坡", "亚太段", 1.35, 103.80),
+    ("172.104.", "JP", "日本", "东京", 35.68, 139.69),
+    ("185.", "DE", "德国", "西欧段", 50.10, 8.68),
+    ("194.", "DE", "德国", "西欧段", 52.50, 13.40),
+    ("198.", "US", "美国", "北美段", 34.00, -118.20),
+)
 
-def sh(cmd, timeout=60):
+IP_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+CIDR_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$")
+
+
+# --------------------------------------------------------------------- 基础工具
+def log(msg, level="info"):
+    if level == "debug" and not VERBOSE:
+        return
+    if FAKE and level == "debug":
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    sys.stdout.write("%s [%s] %s\n" % (ts, level, msg))
+    sys.stdout.flush()
+
+
+def sh(cmd, timeout=15):
+    """执行内核命令，返回 (rc, stdout+stderr)。失败不抛异常，由调用方判定。"""
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except Exception as e:
+    except Exception as e:                                # noqa: BLE001
         return -1, repr(e)[:200]
 
 
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def valid_ip(s):
+    return bool(IP_RE.match(s or "")) and all(int(x) <= 255 for x in s.split("."))
+
+
+def valid_cidr(s):
+    if not CIDR_RE.match(s or ""):
+        return False
+    addr, _, mask = s.partition("/")
+    if not valid_ip(addr):
+        return False
+    return not mask or (mask.isdigit() and 0 <= int(mask) <= 32)
+
+
+def ip_int(s):
+    n = 0
+    for part in s.split("."):
+        n = (n << 8) + int(part)
+    return n
+
+
 def set_name(port):
-    return "hfish_guard_seen_%s" % port
+    return "%s%s" % (SEEN_PREFIX, port)
 
 
-# ---------------------------------------------------------------- 配置与存储
+class Whitelist:
+    """CIDR 匹配缓存；每次热加载重建，避免轮询里反复解析。"""
+
+    def __init__(self, entries=None):
+        self.nets = []
+        self.raw = set()
+        for e in entries or []:
+            cidr = e.get("cidr") if isinstance(e, dict) else e
+            if not cidr:
+                continue
+            self.raw.add(cidr)
+            try:
+                self.nets.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                log("忽略非法白名单条目 %r" % cidr, "warn")
+
+    def __contains__(self, ip):
+        if not ip:
+            return False
+        if ip in self.raw:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self.nets)
+
+
+# --------------------------------------------------------------------- 内核层
+class RealKernel:
+    """ipset + iptables 真实实现。"""
+
+    kind = "netfilter"
+
+    def __init__(self):
+        self.reason = ""
+        if FAKE:
+            self.available = False
+            self.reason = "fake mode"
+            return
+        if not os.path.exists(IPS):
+            self.available = False
+            self.reason = "未找到 %s（ipset 未安装？）" % IPS
+        elif not is_root():
+            self.available = False
+            self.reason = "非 root 运行，无法操作 netfilter"
+        else:
+            rc, out = sh("%s version" % IPS)
+            self.available = rc == 0
+            self.reason = "" if rc == 0 else out.strip()[:120]
+
+    # -- 集合
+    def ensure_sets(self, ports):
+        for p in ports:
+            sh("%s create %s hash:ip counters timeout %d -exist" % (IPS, set_name(p), SEEN_TIMEOUT))
+        sh("%s create %s hash:ip -exist" % (IPS, SET_WHITE))
+        sh("%s create %s hash:ip -exist" % (IPS, SET_BLACK))
+
+    def members(self, port):
+        rc, out = sh("%s list %s" % (IPS, set_name(port)))
+        if rc != 0:
+            return {}
+        result, in_members = {}, False
+        for line in out.splitlines():
+            s = line.strip()
+            if s == "Members:":
+                in_members = True
+                continue
+            if not in_members or not s:
+                continue
+            parts = s.split()
+            pk = 0
+            if "packets" in parts:
+                try:
+                    pk = int(parts[parts.index("packets") + 1])
+                except (ValueError, IndexError):
+                    pk = 0
+            result[parts[0]] = pk
+        return result
+
+    def del_member(self, port, ip):
+        sh("%s del %s %s 2>/dev/null" % (IPS, set_name(port), ip))
+
+    def destroy_set(self, port):
+        sh("%s destroy %s 2>/dev/null" % (IPS, set_name(port)))
+
+    # -- 黑名单
+    def add_black(self, ip):
+        return sh("%s add %s %s -exist" % (IPS, SET_BLACK, ip))[0] == 0
+
+    def del_black(self, ip):
+        sh("%s del %s %s 2>/dev/null" % (IPS, SET_BLACK, ip))
+
+    def black_members(self):
+        return set(self.members_raw(SET_BLACK))
+
+    def members_raw(self, name):
+        rc, out = sh("%s list %s" % (IPS, name))
+        if rc != 0:
+            return []
+        ips, in_members = [], False
+        for line in out.splitlines():
+            s = line.strip()
+            if s == "Members:":
+                in_members = True
+                continue
+            if in_members and s:
+                ips.append(s.split()[0])
+        return ips
+
+    # -- 白名单 / 陷阱
+    def sync_whitelist(self, entries):
+        sh("%s flush %s" % (IPS, SET_WHITE))
+        for e in entries:
+            cidr = e.get("cidr") if isinstance(e, dict) else e
+            if cidr:
+                sh("%s add %s %s -exist 2>/dev/null" % (IPS, SET_WHITE, cidr))
+
+    def trap_rule(self, port, op):
+        # 白名单在内核侧豁免：命中白名单的源根本不进 seen 集合
+        return ("%s %s INPUT -p tcp --dport %s -m set ! --match-set %s src "
+                "-j SET --add-set %s src" % (IPT, op, port, SET_WHITE, set_name(port)))
+
+    def drop_rule(self, op):
+        return "%s %s INPUT -m set --match-set %s src -j DROP" % (IPT, op, SET_BLACK)
+
+    def apply_traps(self, ports, prev_ports=()):
+        self.ensure_sets(ports)
+        for p in prev_ports:
+            if p not in ports:
+                sh(self.trap_rule(p, "-D") + " 2>/dev/null")
+                self.destroy_set(p)
+        for p in ports:
+            if sh(self.trap_rule(p, "-C") + " 2>/dev/null")[0] != 0:
+                sh(self.trap_rule(p, "-I"))
+        if sh(self.drop_rule("-C") + " 2>/dev/null")[0] != 0:
+            sh(self.drop_rule("-I"))
+
+    def trap_present(self, ports):
+        if not ports:
+            return False
+        return all(sh(self.trap_rule(p, "-C") + " 2>/dev/null")[0] == 0 for p in ports)
+
+
+class FakeKernel:
+    """内存态内核：没有 ipset/iptables 也能跑通整条判定链路（本地联调 / 单测）。"""
+
+    kind = "fake"
+    available = True
+    reason = ""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.seen = {}      # port -> {ip: packets}
+        self.white = set()
+        self.white_net = Whitelist([])
+        self.black = set()
+        self.traps = set()
+
+    # -- 用于模拟器 / 自测注入
+    def hit(self, ip, port, packets=1):
+        with self._lock:
+            if ip in self.white_net or ip in self.black:
+                return False
+            bucket = self.seen.setdefault(str(port), {})
+            bucket[ip] = bucket.get(ip, 0) + max(1, int(packets))
+            return True
+
+    def ensure_sets(self, ports):
+        with self._lock:
+            for p in ports:
+                self.seen.setdefault(str(p), {})
+
+    def members(self, port):
+        with self._lock:
+            return dict(self.seen.get(str(port), {}))
+
+    def del_member(self, port, ip):
+        with self._lock:
+            self.seen.get(str(port), {}).pop(ip, None)
+
+    def destroy_set(self, port):
+        with self._lock:
+            self.seen.pop(str(port), None)
+
+    def add_black(self, ip):
+        with self._lock:
+            self.black.add(ip)
+        return True
+
+    def del_black(self, ip):
+        with self._lock:
+            self.black.discard(ip)
+
+    def black_members(self):
+        with self._lock:
+            return set(self.black)
+
+    def sync_whitelist(self, entries):
+        with self._lock:
+            self.white = set(e.get("cidr") if isinstance(e, dict) else e for e in entries)
+            self.white_net = Whitelist(entries)
+
+    def apply_traps(self, ports, prev_ports=()):
+        with self._lock:
+            for p in prev_ports:
+                if p not in ports:
+                    self.seen.pop(str(p), None)
+            for p in ports:
+                self.seen.setdefault(str(p), {})
+            self.traps = set(str(p) for p in ports)
+
+    def trap_present(self, ports):
+        return bool(ports) and all(str(p) in self.traps for p in ports)
+
+
+# --------------------------------------------------------------------- 存储层
 class Store:
     def __init__(self):
         os.makedirs(BASE_DIR, exist_ok=True)
-        if not os.path.exists(CFG_PATH):
-            self._write_cfg(dict(DEFAULT_CONFIG))
-        self.cfg = self._load_cfg()
         self.lock = threading.Lock()
-        self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        if not os.path.exists(CFG_PATH):
+            cfg = dict(DEFAULT_CONFIG)
+            cfg["token"] = "hg-" + secrets.token_hex(12)
+            self._write_cfg(cfg)
+        self.cfg = self._load_cfg()
+        if not self.cfg.get("token"):
+            self.cfg["token"] = "hg-" + secrets.token_hex(12)
+            self._write_cfg(self.cfg)
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+        self.db.row_factory = None
         with self.db:
             self.db.execute("""CREATE TABLE IF NOT EXISTS events(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, ip TEXT,
@@ -75,29 +401,32 @@ class Store:
                 ip TEXT PRIMARY KEY, ts INTEGER, expire INTEGER, port INTEGER,
                 packets INTEGER, ttl INTEGER, reason TEXT, active INTEGER DEFAULT 1)""")
             self.db.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ip ON events(ip)")
 
-    def _read_cfg(self):
+    # -- 配置
+    def _write_cfg(self, cfg):
+        tmp = CFG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CFG_PATH)
         try:
-            with open(CFG_PATH, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+            os.chmod(CFG_PATH, 0o600)
+        except OSError:
+            pass
 
     def _load_cfg(self):
-        raw = self._read_cfg()
+        try:
+            with open(CFG_PATH, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:                            # noqa: BLE001
+            log("读取配置失败，使用默认值：%r" % e, "warn")
+            raw = {}
         cfg = dict(DEFAULT_CONFIG)
-        for k, v in raw.items():
-            if k in cfg:
-                cfg[k] = v
-        if isinstance(cfg["ports"], str):
-            cfg["ports"] = [p.strip() for p in cfg["ports"].split(",") if p.strip().isdigit()]
-        wl = []
-        for w in cfg["whitelist"]:
-            if isinstance(w, str):
-                wl.append({"cidr": w.strip(), "note": "", "at": int(time.time())})
-            elif isinstance(w, dict) and w.get("cidr"):
-                wl.append(w)
-        cfg["whitelist"] = wl
+        cfg.update({k: v for k, v in raw.items() if k in cfg})
+        cfg["ports"] = normalize_ports(cfg["ports"])
+        cfg["whitelist"] = normalize_whitelist(cfg["whitelist"])
+        cfg["hfish"] = normalize_hfish(cfg.get("hfish"))
         if cfg["mode"] not in ("observe", "enforce"):
             cfg["mode"] = "observe"
         return cfg
@@ -106,17 +435,64 @@ class Store:
         with self.lock:
             self._write_cfg(self.cfg)
 
+    def apply_patch(self, body):
+        """热更新配置；返回规范化后的配置。非法值保持原值。"""
+        cfg = self.cfg
+        if "ports" in body:
+            ports = normalize_ports(body["ports"])
+            if ports:
+                cfg["ports"] = ports
+        if "whitelist" in body:
+            cfg["whitelist"] = normalize_whitelist(body["whitelist"])
+        for key, lo, hi in (("threshold", 1, 1000000), ("window", 5, 86400),
+                            ("poll", 1, 3600), ("ttl", 0, 31536000)):
+            if key in body:
+                try:
+                    val = int(body[key])
+                except (TypeError, ValueError):
+                    continue
+                if lo <= val <= hi:
+                    cfg[key] = val
+        if body.get("mode") in ("observe", "enforce"):
+            cfg["mode"] = body["mode"]
+        if isinstance(body.get("hfish"), dict):
+            merged = dict(cfg.get("hfish") or {})
+            merged.update(body["hfish"])
+            cfg["hfish"] = normalize_hfish(merged)
+        self.save_cfg()
+        return cfg
+
+    # -- 事件 / 黑名单
     def event(self, ip, port, packets, verdict, action, detail=""):
         with self.lock:
             with self.db:
                 self.db.execute(
                     "INSERT INTO events(ts, ip, port, packets, verdict, action, detail) "
                     "VALUES(?,?,?,?,?,?,?)",
-                    (int(time.time()), ip, port, packets, verdict, action, detail))
+                    (int(time.time()), ip, int(port or 0), int(packets or 0), verdict, action, detail))
+
+    def events(self, limit=200):
+        with self.lock:
+            return self.db.execute(
+                "SELECT id, ts, ip, port, packets, verdict, action, detail FROM events "
+                "WHERE verdict NOT IN ('config','system','token','error') "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def events_count(self, verdict="over"):
+        with self.lock:
+            row = self.db.execute("SELECT COUNT(*) FROM events WHERE verdict=?", (verdict,)).fetchone()
+            return row[0] if row else 0
+
+    def prune(self, keep=20000):
+        with self.lock:
+            with self.db:
+                self.db.execute(
+                    "DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?", (keep,))
 
     def add_block(self, ip, port, packets, ttl, reason):
-        ttl = int(ttl or self.cfg.get("ttl", 3600))
-        expire = int(time.time()) + ttl
+        ttl = int(ttl if ttl is not None else self.cfg.get("ttl", 3600))
+        now = int(time.time())
+        expire = 0 if ttl <= 0 else now + ttl
         with self.lock:
             with self.db:
                 self.db.execute(
@@ -125,7 +501,7 @@ class Store:
                     "ON CONFLICT(ip) DO UPDATE SET ts=excluded.ts, expire=excluded.expire, "
                     "port=excluded.port, packets=excluded.packets, ttl=excluded.ttl, "
                     "reason=excluded.reason, active=1",
-                    (ip, int(time.time()), expire, port, packets, ttl, reason))
+                    (ip, now, expire, int(port or 0), int(packets or 0), ttl, reason))
 
     def unblock(self, ip):
         with self.lock:
@@ -138,443 +514,1280 @@ class Store:
                 "SELECT ip, ts, expire, port, packets, ttl, reason FROM blocks "
                 "WHERE active=1 ORDER BY ts DESC").fetchall()
 
-    def events(self, limit=200):
+    def kv_get(self, key, default=None):
         with self.lock:
-            return self.db.execute(
-                "SELECT id, ts, ip, port, packets, verdict, action, detail FROM events "
-                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            row = self.db.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else default
 
-    def kv_get(self, k, d=None):
-        with self.lock:
-            r = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
-            return json.loads(r[0]) if r else d
-
-    def kv_set(self, k, v):
+    def kv_set(self, key, value):
         with self.lock:
             with self.db:
                 self.db.execute(
                     "INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                    (k, json.dumps(v)))
+                    (key, json.dumps(value)))
 
 
-# ---------------------------------------------------------------- ipset / iptables
-def sh(cmd, timeout=30):
-    try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except Exception as e:
-        return -1, repr(e)[:200]
+def normalize_ports(raw):
+    if isinstance(raw, str):
+        raw = re.split(r"[,\s]+", raw)
+    out = []
+    for item in raw or []:
+        s = str(item).strip()
+        if s.isdigit() and 1 <= int(s) <= 65535:
+            p = int(s)
+            if p not in out:
+                out.append(p)
+    return out
 
 
-def set_name(port):
-    return "hfish_guard_seen_%s" % port
-
-
-def ensure_sets(ports):
-    for p in ports:
-        sh(f"{IPS} create hfish_guard_seen_{p} hash:ip counters timeout 300 -exist")
-    sh(f"{IPS} create hfish_guard_white hash:ip -exist")
-    sh(f"{IPS} create hfish_guard_black hash:ip -exist")
-
-
-def sync_whitelist(wl):
-    sh(f"{IPS} flush hfish_guard_white")
-    for w in wl:
-        cidr = w["cidr"] if isinstance(w, dict) else w
-        sh(f"{IPS} add hfish_guard_white {cidr} -exist 2>/dev/null")
-
-
-def trap_rule(port, op):
-    return (f"{IPT} {op} INPUT -p tcp --dport {port} "
-            f"-m set ! --match-set hfish_guard_white src "
-            f"-j SET --add-set {set_name(port)} src")
-
-
-def apply_traps(ports, prev_ports=None):
-    ensure_sets(ports)
-    for p in (prev_ports or []):
-        if p not in ports:
-            sh(trap_rule(p, "-D") + " 2>/dev/null")
-            sh(f"{IPS} destroy hfish_guard_seen_{p} 2>/dev/null")
-    for p in ports:
-        rc, _ = sh(trap_rule(p, "-C") + " 2>/dev/null")
-        if rc != 0:
-            sh(trap_rule(p, "-I"))
-    rc, _ = sh(f"{IPT} -C INPUT -m set --match-set hfish_guard_black src -j DROP 2>/dev/null")
-    if rc != 0:
-        sh(f"{IPT} -I INPUT 2 -m set --match-set hfish_guard_black src -j DROP")
-
-
-def trap_present(ports):
-    if not ports:
-        return False
-    return all(sh(trap_rule(p, "-C") + " 2>/dev/null")[0] == 0 for p in ports)
-
-
-def ipset_members(name):
-    rc, out = sh(f"{IPS} list {name} 2>/dev/null")
-    if rc != 0:
-        return {}
-    members, in_m = {}, False
-    for line in out.splitlines():
-        s = line.strip()
-        if s == "Members:":
-            in_m = True
+def normalize_whitelist(raw):
+    out = []
+    for item in raw or []:
+        if isinstance(item, str):
+            cidr, note, at = item.strip(), "", int(time.time())
+        elif isinstance(item, dict) and item.get("cidr"):
+            cidr = str(item["cidr"]).strip()
+            note = item.get("note") or ""
+            at = int(item.get("at") or time.time())
+        else:
             continue
-        if in_m and s:
-            parts = s.split()
-            pk = 0
-            if "packets" in parts:
+        if not valid_cidr(cidr):
+            continue
+        out.append({"cidr": cidr, "note": note, "at": at})
+    return out
+
+
+LEVEL_RANK = {"": 0, "low": 1, "mid": 2, "medium": 2, "high": 3, "critical": 4,
+              "低": 1, "中": 2, "高": 3, "严重": 4}
+
+
+def normalize_hfish(raw):
+    """HFish 联动配置的合并与校验：非法值回落默认，不抛异常。"""
+    base = dict(DEFAULT_CONFIG["hfish"])
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k not in base:
+                continue
+            if k in ("enabled", "verify_tls"):
+                base[k] = bool(v)
+            elif k == "syslog_port":
                 try:
-                    pk = int(parts[parts.index("packets") + 1])
-                except (ValueError, IndexError):
-                    pk = 0
-            members[parts[0]] = pk
-    return members
+                    port = int(v)
+                    if 1 <= port <= 65535:
+                        base[k] = port
+                except (TypeError, ValueError):
+                    pass
+            elif k == "auto_block_level":
+                lv = str(v or "").strip().lower()
+                base[k] = lv if lv in ("low", "mid", "medium", "high", "critical") else ""
+            else:
+                base[k] = str(v or "").strip()
+    return base
 
 
-# ---------------------------------------------------------------- Guard 核心
-class Guard:
-    def __init__(self, store):
+# --------------------------------------------------------------------- 归属地
+class Geo:
+    """归属地解析：geo.json 自定义表 > MaxMind mmdb > 内置粗粒度表。
+
+    mmdb 需要 geoip2 包与数据库文件；两者缺一不会报错，只是精度下降，
+    响应里用 source 字段标明结果来源（custom / mmdb / approx / private / none）。
+    """
+
+    MMDB_CANDIDATES = (
+        os.path.join(BASE_DIR, "GeoLite2-City.mmdb"),
+        "/usr/share/GeoIP/GeoLite2-City.mmdb",
+        "/var/lib/GeoIP/GeoLite2-City.mmdb",
+    )
+
+    def __init__(self):
+        self.custom = {}
+        try:
+            with open(GEO_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.custom = data
+        except FileNotFoundError:
+            pass
+        except Exception as e:                            # noqa: BLE001
+            log("geo.json 解析失败：%r" % e, "warn")
+        self.reader = None
+        self.mmdb_path = ""
+        for path in self.MMDB_CANDIDATES:
+            if os.path.exists(path):
+                try:
+                    import geoip2.database                     # type: ignore
+                    self.reader = geoip2.database.Reader(path)
+                    self.mmdb_path = path
+                    break
+                except Exception as e:                         # noqa: BLE001
+                    log("mmdb 加载失败（%s）：%r" % (path, e), "warn")
+        self.cache = {}
+
+    def source(self):
+        if self.reader:
+            return "mmdb"
+        if self.custom:
+            return "custom"
+        return "approx"
+
+    def lookup(self, ip):
+        ip = (ip or "").split("/")[0].strip()
+        if not valid_ip(ip):
+            return {"ip": ip, "cc": "--", "cn": "未知", "city": "-",
+                    "lat": None, "lon": None, "org": "-", "source": "none"}
+        if ip in self.cache:
+            return self.cache[ip]
+        result = self._lookup(ip)
+        if len(self.cache) > 4096:
+            self.cache.clear()
+        self.cache[ip] = result
+        return result
+
+    def _lookup(self, ip):
+        if ip in self.custom:
+            c = self.custom[ip]
+            return {"ip": ip, "cc": c.get("cc", "--"), "cn": c.get("cn", "未知"),
+                    "city": c.get("city", "-"), "lat": c.get("lat"), "lon": c.get("lon"),
+                    "org": c.get("org", "-"), "source": "custom"}
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.is_private or addr.is_loopback or addr.is_link_local:
+                return {"ip": ip, "cc": "LAN", "cn": "内网地址", "city": "RFC1918",
+                        "lat": None, "lon": None, "org": "私有网段 · 不投影", "source": "private"}
+            if addr.is_reserved or addr.is_multicast:
+                return {"ip": ip, "cc": "RSV", "cn": "保留地址", "city": "-",
+                        "lat": None, "lon": None, "org": "非公网", "source": "private"}
+        except ValueError:
+            pass
+        if self.reader:
+            try:
+                rec = self.reader.city(ip)
+                return {"ip": ip,
+                        "cc": rec.country.iso_code or "--",
+                        "cn": rec.country.names.get("zh-CN") or rec.country.name or "未知",
+                        "city": (rec.city.names.get("zh-CN") or rec.city.name or "-") if rec.city else "-",
+                        "lat": rec.location.latitude, "lon": rec.location.longitude,
+                        "org": "mmdb", "source": "mmdb"}
+            except Exception:                                # noqa: BLE001
+                pass
+        for prefix, cc, cn, city, lat, lon in GEO_APPROX:
+            if ip.startswith(prefix):
+                return {"ip": ip, "cc": cc, "cn": cn, "city": city, "lat": lat,
+                        "lon": lon, "org": "网段推算", "source": "approx", "approx": True}
+        return {"ip": ip, "cc": "--", "cn": "未收录", "city": "-", "lat": None,
+                "lon": None, "org": "未知", "source": "none"}
+
+
+# --------------------------------------------------------------------- HFish 联动
+# 官方文档：https://hfish.net/#/api-config 、 https://hfish.net/#/syslog 、 https://hfish.net/#/detail-alarm
+# HFish 对外只有三种出口，且都是「读」或「推」，没有封禁写接口：
+#   1) 开放 API   POST /api/v1/attack/ip?api_key=…  取攻击来源/详情（拉）
+#   2) syslog     TCP/UDP，最多 5 路，字段见官方 syslog 表（推）
+#   3) webhook    钉钉/飞书/企微/自定义（推）
+# 守卫消费 2)/3) 做事件富化与可选的按等级封禁，消费 1) 做情报补充；
+# 判定与封禁仍然走内核计数，因为 HFish 不知道"没被它记录的端口触碰"。
+
+def _pick(data, *keys):
+    for k in keys:
+        v = data.get(k)
+        if v not in (None, "", "N/A", "n/a", "N/a"):
+            return v
+    return ""
+
+
+def parse_hfish_payload(raw):
+    """把 syslog 行或 webhook JSON 归一成事件字段；容忍 JSON / key:value / 纯文本三种形态。"""
+    data, text = {}, ""
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                data = obj
+        except ValueError:
+            data = {}
+    if not data:
+        # HFish syslog 形如：client: node1, src_ip: 1.2.3.4, attack_type: scan, ...
+        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*("([^"]*)"|[^,;\n]+)', text):
+            data[m.group(1)] = (m.group(3) if m.group(3) is not None else m.group(2)).strip().strip('"')
+        if not data:
+            m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
+            if not m:
+                return {}
+            data = {"src_ip": m.group(1), "info": text[:300]}
+    # 自定义 webhook 可能把事件塞在 data / content / event 里
+    for nest in ("data", "content", "event", "events"):
+        if isinstance(data.get(nest), dict):
+            data = data[nest]
+            break
+    ip = str(_pick(data, "src_ip", "attack_ip", "source_ip", "remote_ip", "ip") or "").strip()
+    port_raw = str(_pick(data, "scan_port", "dst_port", "port") or "").split("/")[0].strip()
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 0
+    return {
+        "ip": ip,
+        "port": port,
+        "attack_type": str(_pick(data, "attack_type", "type") or ""),
+        "pot": str(_pick(data, "class", "pot", "service") or ""),
+        "client": str(_pick(data, "client", "client_ip", "node") or ""),
+        "account": str(_pick(data, "account", "user") or ""),
+        "level": str(_pick(data, "threat_level", "level") or "").lower(),
+        "threat": str(_pick(data, "threat_name", "labels") or ""),
+        "geo": str(_pick(data, "geo", "location") or ""),
+        "count": int(str(_pick(data, "count", "times", "attack_count") or 0).strip() or 0)
+        if str(_pick(data, "count", "times", "attack_count") or "0").strip().isdigit() else 0,
+        "info": str(_pick(data, "info", "detail") or "")[:300],
+    }
+
+
+class Ingest:
+    """HFish 告警接入：去重、可选按等级封禁、落库。"""
+
+    def __init__(self, store, monitor):
         self.store = store
-        self.prev = {}          # (port, ip) -> 上次包计数
-        self.sec = {}           # epoch 秒 -> 全局命中包数（UI 脉冲图）
+        self.monitor = monitor
+        self.lock = threading.Lock()
+        self.seen = {}
+        self.counts = {"syslog": 0, "webhook": 0, "skipped": 0, "last": 0}
+
+    def push(self, payload, via="syslog"):
+        data = parse_hfish_payload(payload)
+        ip = data.get("ip") or ""
+        if not valid_ip(ip):
+            with self.lock:
+                self.counts["skipped"] += 1
+            return None
+        cfg = self.store.cfg
+        if ip in Whitelist(cfg.get("whitelist", [])):
+            with self.lock:
+                self.counts["skipped"] += 1
+            return None
+        # 同一 (IP, 攻击类型, 蜜罐) 60s 内只记一条，挡住告警洪水
+        key = (ip, data.get("attack_type"), data.get("pot"))
+        now = time.time()
+        with self.lock:
+            if now - self.seen.get(key, 0) < 60:
+                self.counts["skipped"] += 1
+                return None
+            self.seen[key] = now
+            if len(self.seen) > 4000:
+                self.seen = {k: v for k, v in self.seen.items() if now - v < 60}
+            if via in self.counts:
+                self.counts[via] += 1
+            self.counts["last"] = int(now)
+
+        hf = cfg.get("hfish", {})
+        need = hf.get("auto_block_level") or ""
+        level = data.get("level") or ""
+        action = "蜜罐告警"
+        if need and LEVEL_RANK.get(level, 0) >= LEVEL_RANK.get(need, 99) and cfg.get("mode") == "enforce":
+            self.monitor.kernel.add_black(ip)
+            self.store.add_block(ip, data.get("port") or 0, data.get("count") or 0,
+                                 cfg.get("ttl", 3600), "HFish %s 级告警" % (level or "high"))
+            self.monitor.prev = {k: v for k, v in self.monitor.prev.items() if k[1] != ip}
+            action = "自动封禁（HFish 告警）"
+            log("HFish 高危告警，封禁 %s（%s / %s）" % (ip, data.get("attack_type"), data.get("pot")), "warn")
+
+        detail = " · ".join(x for x in (
+            ("类型 " + data["attack_type"]) if data.get("attack_type") else "",
+            ("蜜罐 " + data["pot"]) if data.get("pot") else "",
+            ("账号 " + data["account"]) if data.get("account") else "",
+            ("等级 " + level) if level else "",
+            ("来源 " + via)) if x)
+        self.store.event(ip, data.get("port") or 0, data.get("count") or 0, "hfish", action, detail)
+        return {"ip": ip, "action": action, "detail": detail}
+
+
+class SyslogReceiver(threading.Thread):
+    """同时监听 UDP 与 TCP 的 syslog 端口：HFish 告警策略里两种协议都支持。"""
+
+    def __init__(self, port, ingest):
+        super().__init__(daemon=True)
+        self.port = int(port)
+        self.ingest = ingest
+        self.bound = {"udp": False, "tcp": False}
+        self.stop_flag = threading.Event()
+
+    def run(self):
+        threading.Thread(target=self._udp, daemon=True).start()
+        self._tcp()
+
+    def _udp(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", self.port))
+        except OSError as e:
+            log("syslog UDP 绑定 :%d 失败：%s" % (self.port, e), "warn")
+            return
+        self.bound["udp"] = True
+        while not self.stop_flag.is_set():
+            try:
+                data, _ = sock.recvfrom(65535)
+            except OSError:
+                break
+            try:
+                self.ingest.push(data.decode("utf-8", "replace"), "syslog")
+            except Exception as e:                     # noqa: BLE001
+                log("syslog 解析失败：%r" % e, "warn")
+
+    def _tcp(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", self.port))
+            srv.listen(8)
+        except OSError as e:
+            log("syslog TCP 绑定 :%d 失败：%s" % (self.port, e), "warn")
+            return
+        self.bound["tcp"] = True
+        srv.settimeout(1.0)
+        while not self.stop_flag.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._conn, args=(conn,), daemon=True).start()
+
+    def _conn(self, conn):
+        conn.settimeout(60)
+        buf = b""
+        try:
+            while not self.stop_flag.is_set():
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    self._line(line)
+        except OSError:
+            pass
+        finally:
+            try:
+                if buf.strip():
+                    self._line(buf)
+                conn.close()
+            except OSError:
+                pass
+
+    def _line(self, raw):
+        text = raw.decode("utf-8", "replace").strip()
+        m = re.match(r"^(\d{1,6})\s(\{.*)$", text, re.S)     # RFC6587 八位组计数帧
+        if m:
+            text = m.group(2)[: int(m.group(1))]
+        if text:
+            try:
+                self.ingest.push(text, "syslog")
+            except Exception as e:                     # noqa: BLE001
+                log("syslog 行解析失败：%r" % e, "warn")
+
+
+class HfishApi(threading.Thread):
+    """按官方开放 API 拉攻击来源，只做情报补充，不参与阈值判定。
+
+    接口：POST {base}/api/v1/attack/ip?api_key=…（HFish 3.3.x）
+    自签证书场景默认不校验证书；返回结构在不同版本略有差异，这里做兼容解析。
+    """
+
+    def __init__(self, store):
+        super().__init__(daemon=True)
+        self.store = store
+        self.stop_flag = threading.Event()
+        self.ok = False
+        self.error = ""
+        self.last_pull = 0
+        self.intel = {}
+
+    def run(self):
+        while not self.stop_flag.wait(60):
+            try:
+                self.pull()
+            except Exception as e:                     # noqa: BLE001
+                self.ok = False
+                self.error = repr(e)[:160]
+
+    def pull(self):
+        hf = self.store.cfg.get("hfish", {})
+        base, key = hf.get("api_base") or "", hf.get("api_key") or ""
+        if not base or not key:
+            return False
+        url = base.rstrip("/") + "/api/v1/attack/ip?api_key=" + urllib.parse.quote(key)
+        body = json.dumps({"start_time": 0, "end_time": 0, "intranet": 0,
+                           "threat_label": []}).encode()
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            ctx = None
+            if not hf.get("verify_tls", False):
+                ctx = ssl._create_unverified_context()      # HFish 默认自签证书
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except Exception as e:                         # noqa: BLE001
+            self.ok = False
+            self.error = repr(e)[:160]
+            return False
+        items = payload
+        if isinstance(payload, dict):
+            for k in ("data", "list", "items", "result"):
+                if isinstance(payload.get(k), (list, dict)):
+                    items = payload[k]
+                    break
+        if isinstance(items, dict):
+            items = items.get("list") or items.get("items") or []
+        intel = {}
+        for row in items if isinstance(items, list) else []:
+            if not isinstance(row, dict):
+                continue
+            ip = str(_pick(row, "src_ip", "attack_ip", "ip") or "")
+            if not valid_ip(ip):
+                continue
+            intel[ip] = {
+                "count": _pick(row, "count", "attack_count", "times") or 0,
+                "labels": _pick(row, "threat_label", "labels") or [],
+                "last": int(time.time()),
+            }
+        self.intel = dict(list(intel.items())[:500])
+        self.ok = True
+        self.error = ""
+        self.last_pull = int(time.time())
+        return True
+
+
+# --------------------------------------------------------------------- 控制面
+class Monitor:
+    def __init__(self, store, kernel, geo):
+        self.store = store
+        self.kernel = kernel
+        self.geo = geo
+        self.prev = {}              # (port, ip) -> 上次 packets 计数
+        self.buckets = {}           # (ip, port, slot) -> 窗口内包数
+        self.alerted = set()        # (ip, slot) 已判定过，避免同一窗口重复记录
+        self.series = []            # [(ts, delta)] 最近 N 次轮询的全局增量
+        self.port_hits = {}         # port -> 累计（本次启动以来）
         self.ports_applied = []
         self.last_poll = 0
-        self.tick = 0
+        self.last_expire = 0
+        self.started_at = int(time.time())
+        self.window = int(store.cfg.get("window", 60))
+        self.poll_interval = int(store.cfg.get("poll", POLL_DEFAULT))
+        self.last_error = ""
+        self.stats = {"polls": 0, "blocked": 0, "events": 0}
 
+    # -- 规则下发
     def apply_all(self):
         cfg = self.store.cfg
-        ports = [str(x) for x in cfg["ports"]]
-        ensure_sets(ports)
-        sync_whitelist(cfg["whitelist"])
-        apply_traps(ports, self.ports_applied)
+        ports = [str(p) for p in cfg["ports"]]
+        self.kernel.ensure_sets(ports)
+        self.kernel.sync_whitelist(cfg["whitelist"])
+        self.kernel.apply_traps(ports, self.ports_applied)
         self.ports_applied = list(ports)
+        self.reload_runtime()
+        # 重启后把仍然有效的封禁重新写回内核集合（幂等）
+        for row in self.store.active_blocks():
+            self.kernel.add_black(row[0])
 
-    def apply_traps(self, ports, prev_ports=None):
-        ensure_sets(ports)
-        for p in (prev_ports or []):
-            if p not in ports:
-                sh(trap_rule(p, "-D") + " 2>/dev/null")
-                sh(f"{IPS} destroy hfish_guard_seen_{p} 2>/dev/null")
-        for p in ports:
-            rc, _ = sh(trap_rule(p, "-C") + " 2>/dev/null")
-            if rc != 0:
-                sh(trap_rule(p, "-I"))
-        rc, _ = sh(f"{IPT} -C INPUT -m set --match-set hfish_guard_black src -j DROP 2>/dev/null")
-        if rc != 0:
-            sh(f"{IPT} -I INPUT 2 -m set --match-set hfish_guard_black src -j DROP")
-        self.ports_applied = list(ports)
-
-    def poll_once(self):
-        global window_hits
+    def reload_runtime(self):
         cfg = self.store.cfg
-        ports = [str(x) for x in cfg["ports"]]
-        window = int(cfg.get("window", 60))
-        threshold = int(cfg.get("threshold", 40))
-        whitelist = set(w["cidr"] for w in cfg.get("whitelist", []))
-        now = int(time.time())
-        self.last_poll = now
+        self.window = max(5, int(cfg.get("window", 60)))
+        self.poll_interval = max(1, int(cfg.get("poll", POLL_DEFAULT)))
+        self.whitelist = Whitelist(cfg.get("whitelist"))
 
-        per_ip, per_port = {}, {}
-        for p in ports:
-            members = ipset_members("hfish_guard_seen_%s" % p)
-            if members is None:
-                continue
+    # -- 单次轮询
+    def poll_once(self):
+        cfg = self.store.cfg
+        ports = [str(p) for p in cfg["ports"]]
+        now = int(time.time())
+        slot = now // self.window
+        threshold = int(cfg.get("threshold", 40))
+        self.last_poll = now
+        self.stats["polls"] += 1
+        total_delta = 0
+        per_ip = {}
+        per_port = {}
+        blocked = self.blocked            # 一次查询，避免每个 IP 都打一次 sqlite
+
+        for port in ports:
+            members = self.kernel.members(port) or {}
             for ip, pk in members.items():
-                key = (p, ip)
+                key = (port, ip)
                 prev = self.prev.get(key)
                 delta = pk - prev if (prev is not None and pk >= prev) else pk
                 self.prev[key] = pk
-                if delta <= 0 or ip in whitelist:
+                if delta <= 0:
                     continue
-                hk = (ip, p, int(now // window))
-                window_hits[hk] = window_hits.get(hk, 0) + delta
+                if ip in self.whitelist:
+                    continue
+                # 已封禁的 IP 不再计数，避免封禁期间刷屏
+                if ip in blocked:
+                    continue
+                self.buckets[(ip, port, slot)] = self.buckets.get((ip, port, slot), 0) + delta
                 per_ip[ip] = per_ip.get(ip, 0) + delta
-                per_port_delta[p] = per_port_delta.get(p, 0) + delta
-        # 消失的 (port, ip) 清理
+                per_port[port] = per_port.get(port, 0) + delta
+                self.port_hits[port] = self.port_hits.get(port, 0) + delta
+                total_delta += delta
+
+        # 清理已消失的成员，防止 prev 无限增长
         live = set()
-        for p in ports:
-            for ip in ipset_members("hfish_guard_seen_%s" % p):
-                live.add((p, ip))
-        for key in list(self.prev):
-            if key not in live:
-                self.prev.pop(key, None)
-        for hk in [k for k in window_hits if k[2] < int(now // window) - 2]:
-            window_hits.pop(hk, None)
-        if per_ip:
-            self.store.kv_set("total_packets",
-                              int(self.store.kv_get("total_packets", 0)) + sum(per_ip.values()))
-        if per_port:
-            pt = self.store.kv_get("port_totals", {})
-            for p, d in per_port.items():
-                pt[p] = pt.get(p, 0) + d
-            self.store.kv_set("port_totals", pt)
-            pl = self.store.kv_get("port_last", {})
-            for p in per_port:
-                pl[p] = now
-            self.store.kv_set("port_last", pl)
+        for port in ports:
+            for ip in (self.kernel.members(port) or {}):
+                live.add((port, ip))
+        if live:
+            self.prev = {k: v for k, v in self.prev.items() if k in live or k[1] in blocked}
 
-        # 判定
-        blocked = set(r[0] for r in self.store.active_blocks())
-        wl_cidr = set(w["cidr"] for w in cfg.get("whitelist", []))
-        for ip, total in per_ip.items():
-            if total < threshold or ip in blocked or ip in wl_cidr:
+        # 清理 2 个窗口以前的分桶
+        if self.buckets:
+            self.buckets = {k: v for k, v in self.buckets.items() if k[2] >= slot - 1}
+        self.alerted = set(a for a in self.alerted if a[1] >= slot)
+
+        self.series.append((now, total_delta))
+        self.series = self.series[-120:]
+
+        if total_delta:
+            self.store.kv_set("total_packets", int(self.store.kv_get("total_packets", 0)) + total_delta)
+            totals = self.store.kv_get("port_totals", {})
+            last = self.store.kv_get("port_last", {})
+            for port, delta in per_port.items():
+                totals[port] = int(totals.get(port, 0)) + delta
+                last[port] = now
+            self.store.kv_set("port_totals", totals)
+            self.store.kv_set("port_last", last)
+
+        self.judge(slot, threshold)
+        self.expire_blocks(now)
+
+    # -- 判定与执行
+    def judge(self, slot, threshold):
+        cfg = self.store.cfg
+        mode = cfg.get("mode", "observe")
+        ttl = int(cfg.get("ttl", 3600))
+        window_sum = {}
+        top_port = {}
+        for (ip, port, s), value in self.buckets.items():
+            if s != slot:
                 continue
-            hits_by_port = {}
-            for (i2, p2, s2), v in window_hits.items():
-                if i2 == ip:
-                    hits_by_port[p2] = hits_by_port.get(p2, 0) + v
-            top_port = max(hits_by_port, key=lambda x: hits_by_port[x]) if hits_by_port else int(ports[0])
-            mode = cfg.get("mode", "observe")
-            verdict = "over"
-            if mode == "enforce":
-                action = "自动封禁"
-                sh(f"{IPS} add hfish_guard_black {ip} -exist")
-                self.store.add_block(ip, top_port, total, cfg.get("ttl", 3600), "超阈值自动封禁")
-                for pp in ports:
-                    sh(f"{IPS} del hfish_guard_seen_{pp} {ip} 2>/dev/null")
-                for hk in [k for k in window_hits if k[0] == ip]:
-                    window_hits.pop(hk, None)
-                self.prev = {k: v for k, v in self.prev.items() if k[1] != ip}
-            else:
-                action = "观察记录"
-            self.store.event(ip, top_port, total, verdict, action, "滑动窗口 %ds" % window)
+            window_sum[ip] = window_sum.get(ip, 0) + value
+            if value > top_port.get(ip, (0, 0))[1]:
+                top_port[ip] = (port, value)
 
-        # TTL 过期
-        self.tick += 1
-        if self.tick % 3 == 0:
-            for ip, ts, expire, port, packets, ttl, reason in self.store.active_blocks():
-                if expire and 0 < expire < now:
-                    sh(f"{IPS} del hfish_guard_black {ip} 2>/dev/null")
-                    self.store.unblock(ip)
-                    self.store.event(ip, port, packets, "expired", "TTL 到期自动解封", "")
+        for ip, total in window_sum.items():
+            if total < threshold:
+                continue
+            if (ip, slot) in self.alerted:
+                continue
+            self.alerted.add((ip, slot))
+            port = int(top_port.get(ip, (0, 0))[0] or 0)
+            if mode == "enforce":
+                self.kernel.add_black(ip)
+                self.store.add_block(ip, port, total, ttl, "超阈值自动封禁")
+                self.store.event(ip, port, total, "over", "自动封禁",
+                                 "滑动窗口 %ds / 阈值 %d" % (self.window, threshold))
+                self.stats["blocked"] += 1
+                log("封禁 %s（%d 包 / %ds，端口 %s）" % (ip, total, self.window, port), "warn")
+                # 清零该 IP 的计数，防止解封后立刻二次触发
+                for p in [str(x) for x in cfg["ports"]]:
+                    self.kernel.del_member(p, ip)
+                self.prev = {k: v for k, v in self.prev.items() if k[1] != ip}
+                self.buckets = {k: v for k, v in self.buckets.items() if k[0] != ip}
+            else:
+                self.store.event(ip, port, total, "over", "观察记录",
+                                 "滑动窗口 %ds / 阈值 %d" % (self.window, threshold))
+                self.stats["events"] += 1
+                log("命中阈值 %s（%d 包 / %ds）观察模式仅记录" % (ip, total, self.window))
+
+    # -- TTL 过期
+    def expire_blocks(self, now):
+        if now - self.last_expire < 15:
+            return
+        self.last_expire = now
+        for ip, _ts, expire, port, packets, _ttl, _reason in self.store.active_blocks():
+            if expire and expire <= now:
+                self.kernel.del_black(ip)
+                self.store.unblock(ip)
+                self.store.event(ip, port, packets, "expired", "TTL 到期自动解封", "")
+                log("自动解封 %s（TTL 到期）" % ip)
+
+    # -- 对外快照
+    @property
+    def blocked(self):
+        return set(row[0] for row in self.store.active_blocks())
 
     def window_series(self):
-        """最近 60 个轮询周期的全局命中增量（供 UI 脉冲图）"""
-        return sorted(sec_series.items())[-60:]
+        return [[ts, delta] for ts, delta in self.series[-60:]]
+
+    def window_sum(self):
+        slot = int(time.time()) // self.window
+        out = {}
+        for (ip, _port, s), value in self.buckets.items():
+            if s == slot:
+                out[ip] = out.get(ip, 0) + value
+        return sum(out.values())
 
     def top_src(self):
-        now = int(time.time())
-        per_ip = {}
-        for (ip, p, slot), v in window_hits.items():
-            if slot >= int(now // window) - 1:
-                per_ip[ip] = per_ip.get(ip, 0) + v
-        return max(per_ip.values()) if per_ip else 0
+        slot = int(time.time()) // self.window
+        out = {}
+        for (ip, _port, s), value in self.buckets.items():
+            if s == slot:
+                out[ip] = out.get(ip, 0) + value
+        return max(out.values()) if out else 0
 
 
-window_hits = {}
-sec_series = {}
-STORE = None
-GUARD = None
+# --------------------------------------------------------------------- 模拟器
+class Simulator(threading.Thread):
+    """--fake 下的攻击流量发生器：让整条链路在没有内核的机器上也能跑起来。"""
 
+    ATTACKERS = ("185.220.101.42", "45.155.205.17", "91.240.118.203", "103.144.137.9",
+                 "194.26.29.88", "198.98.51.34", "23.129.64.118", "172.104.93.77",
+                 "89.248.167.13", "5.188.206.204")
 
-def poll_loop():
-    GUARD.apply_all()
-    while True:
-        try:
-            GUARD.poll_once()
-        except Exception as e:
+    def __init__(self, kernel, store, monitor):
+        super().__init__(daemon=True)
+        self.kernel = kernel
+        self.store = store
+        self.monitor = monitor
+        self.stop_flag = threading.Event()
+        self.burst_ip = ""
+
+    def run(self):
+        round_no = 0
+        while not self.stop_flag.wait(1.5):
+            round_no += 1
+            ports = [str(p) for p in self.store.cfg["ports"]]
+            if not ports:
+                continue
             try:
-                STORE.event("system", 0, 0, 0, "error", "守护异常 " + str(e)[:200])
-            except Exception:
-                pass
-        time.sleep(int(STORE.cfg.get("poll", 10)))
+                # 常态噪声：随机源打随机端口，少量包
+                for _ in range(2):
+                    ip = self.ATTACKERS[int(time.time() * 1000 + round_no) % len(self.ATTACKERS)]
+                    self.kernel.hit(ip, ports[int(time.time() + round_no) % len(ports)], 1)
+                # 每 5 轮造一次突发，足以跨过阈值
+                if round_no % 5 == 0:
+                    self.burst_ip = self.ATTACKERS[round_no // 5 % len(self.ATTACKERS)]
+                    port = ports[round_no % len(ports)]
+                    self.kernel.hit(self.burst_ip, port, 48)
+                    log("模拟突发 %s → :%s 48 包" % (self.burst_ip, port), "debug")
+                # 白名单源也来凑热闹：内核侧应当直接丢掉
+                for entry in self.store.cfg.get("whitelist", []):
+                    cidr = entry.get("cidr", "")
+                    if "/" not in cidr and valid_ip(cidr):
+                        self.kernel.hit(cidr, ports[0], 99)
+            except Exception as e:                            # noqa: BLE001
+                log("模拟器异常：%r" % e, "warn")
 
 
-# ---------------------------------------------------------------- HTTP
+# --------------------------------------------------------------------- 接口面
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HFishGuard/1.1"
+    server_version = "HFishGuard/" + VERSION
+    protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):
-        pass
+    # -- 基础响应
+    def log_message(self, fmt, *args):                    # 静默：由 log() 统一输出
+        if VERBOSE:
+            log("%s %s" % (self.address_string(), fmt % args), "debug")
+
+    def _headers(self, code=200, ctype="application/json; charset=utf-8", length=0):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
 
     def _json(self, obj, code=200):
-        data = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._headers(code, length=len(data))
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
-    def _static(self):
-        idx = None
+    def _read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        if length > 1 << 20:
+            raise ApiError(413, "请求体过大")
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            raise ApiError(400, "请求体不是合法 JSON")
+        return body if isinstance(body, dict) else {}
+
+    # -- 鉴权
+    def _token(self):
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        if auth:
+            return auth.strip()
+        query = urllib.parse.urlparse(self.path).query
+        return (urllib.parse.parse_qs(query).get("token") or [""])[0]
+
+    def _authorized(self):
+        expected = STORE.cfg.get("token") or ""
+        given = self._token()
+        return bool(expected) and bool(given) and secrets.compare_digest(given, expected)
+
+    def _require_auth(self):
+        if not self._authorized():
+            raise ApiError(401, "凭证无效或缺失")
+
+    # -- 静态资源
+    def _ui_dir(self):
         for d in UI_CANDIDATES:
-            c = os.path.join(d, "index.html")
-            if os.path.exists(c):
-                idx = c
-                break
-        if not idx:
-            self._json({"error": "ui not found"}, 404)
-            return
-        with open(idx, "rb") as f:
+            path = os.path.abspath(d)
+            if os.path.isdir(path):
+                return path
+        return ""
+
+    def _static(self, rel="index.html"):
+        root = self._ui_dir()
+        if not root:
+            raise ApiError(404, "UI 目录不存在")
+        target = os.path.abspath(os.path.join(root, rel))
+        if not target.startswith(root + os.sep) and target != root:
+            raise ApiError(403, "禁止越界访问")
+        if not os.path.isfile(target):
+            raise ApiError(404, "文件不存在")
+        ext = os.path.splitext(target)[1].lower()
+        ctype = {".html": "text/html; charset=utf-8",
+                 ".css": "text/css; charset=utf-8",
+                 ".js": "application/javascript; charset=utf-8",
+                 ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml",
+                 ".ico": "image/x-icon", ".json": "application/json; charset=utf-8"}.get(
+                     ext, "application/octet-stream")
+        with open(target, "rb") as f:
             data = f.read()
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        # 升级后必须拿到新 UI：静态页不允许缓存（曾经因为浏览器缓存旧 HTML 导致新功能"消失"）
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    # -- 路由
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_HEAD(self):
+        self.do_GET()
 
     def do_GET(self):
-        path, _, _ = self.path.partition("?")
-        if path in ("/", "/web", "/web/", "/index.html"):
-            self._static()
-            return
-        if path == "/api/status":
-            cfg = STORE.cfg
-            evs = STORE.events(10000)
-            over = [e for e in evs if e[5] == "over"]
-            self._json({
-                "mode": cfg["mode"],
-                "threshold": cfg["threshold"],
-                "window": cfg["window"],
-                "poll": cfg.get("poll", 10),
-                "ttl": cfg["ttl"],
-                "ports": cfg["ports"],
-                "whitelist": cfg["whitelist"],
-                "blacklist_count": len(STORE.active_blocks()),
-                "events_count": len(over),
-                "trap": trap_present([str(x) for x in cfg["ports"]]),
-                "last_poll": GUARD.last_poll if GUARD else 0,
-                "total_packets": int(STORE.kv_get("total_packets", 0)),
-                "per_port": STORE.kv_get("port_totals", {}),
-                "port_last": STORE.kv_get("port_last", {}),
-                "window_series": GUARD.window_series() if GUARD else [],
-                "top_src": GUARD.top_src() if GUARD else 0,
-                "recent": [{"ts": r[1] * 1000, "ip": r[2], "port": r[3], "packets": r[4],
-                            "verdict": r[5], "action": r[6]} for r in STORE.events(5)],
-            })
-        elif path == "/api/events":
-            evs = STORE.events(500)
-            self._json([{"id": "EV-%d" % r[0], "ts": r[1] * 1000, "ip": r[2], "port": r[3],
-                         "packets": r[4], "verdict": r[5], "action": r[6]} for r in evs])
-        elif path == "/api/blacklist":
-            self._json([{"ip": r[0], "at": r[1] * 1000, "expire": r[2] * 1000, "port": r[3],
-                         "packets": r[4], "ttl": r[5], "reason": r[6]}
-                        for r in STORE.active_blocks()])
-        elif path == "/api/whitelist":
-            self._json(STORE.cfg.get("whitelist", []))
-        elif path == "/api/config":
-            self._json(STORE.cfg)
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch("GET")
 
     def do_POST(self):
-        path, _, _ = self.path.partition("?")
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            body = {}
-        if path == "/api/config":
-            cfg = STORE.cfg
-            for k in ("mode", "threshold", "window", "poll", "ttl", "ports", "whitelist"):
-                if k in body:
-                    cfg[k] = body[k]
-            if isinstance(cfg["ports"], str):
-                cfg["ports"] = [p.strip() for p in cfg["ports"].split(",") if p.strip().isdigit()]
-            wl = []
-            for w in cfg["whitelist"]:
-                if isinstance(w, dict) and w.get("cidr"):
-                    wl.append(w)
-                elif isinstance(w, str):
-                    wl.append({"cidr": w.strip(), "note": "", "at": int(time.time())})
-            cfg["whitelist"] = wl
-            if cfg["mode"] not in ("observe", "enforce"):
-                cfg["mode"] = "observe"
-            STORE.save_cfg()
-            sync_whitelist(cfg["whitelist"])
-            if GUARD:
-                GUARD.apply_traps([str(x) for x in cfg["ports"]], GUARD.ports_applied)
-                GUARD.ports_applied = list(cfg["ports"])
-            STORE.event("system", 0, 0, 0, "config", "配置热加载 mode=%s" % cfg["mode"])
-            self._json({"ok": True, "config": cfg})
-        elif path == "/api/blacklist":
-            ip = (body.get("ip") or "").strip()
-            if not re.match(r"^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$", ip):
-                self._json({"error": "bad ip"}, 400)
-                return
-            sh(f"{IPS} add hfish_guard_black {ip} -exist")
-            STORE.add_block(ip, int(body.get("port") or 0), 0,
-                            int(body.get("ttl") or 0), body.get("reason") or "手动封禁")
-            STORE.event(ip, int(body.get("port") or 0), 0, "manual", "手动封禁", body.get("note") or "")
-            self._json({"ok": True})
-        elif path == "/api/blacklist/delete":
-            ip = (body.get("ip") or "").strip()
-            sh(f"{IPS} del hfish_guard_black {ip} 2>/dev/null")
-            STORE.unblock(ip)
-            STORE.event(ip, 0, 0, "manual", "手动解封", "")
-            self._json({"ok": True})
-        elif path == "/api/whitelist":
-            cidr = (body.get("cidr") or "").strip()
-            if not re.match(r"^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$", cidr):
-                self._json({"error": "bad cidr"}, 400)
-                return
-            wl = STORE.cfg["whitelist"]
-            if not any((w.get("cidr") == cidr) for w in wl):
-                wl.append({"cidr": cidr, "note": body.get("note") or "", "at": int(time.time())})
-                STORE.save_cfg()
-                sync_whitelist(wl)
-            self._json({"ok": True, "whitelist": wl})
-        elif path == "/api/whitelist/delete":
-            cidr = (body.get("cidr") or "").strip()
-            cfg = STORE.cfg
-            cfg["whitelist"] = [w for w in cfg["whitelist"] if w.get("cidr") != cidr]
-            STORE.save_cfg()
-            sync_whitelist(cfg["whitelist"])
-            self._json({"ok": True})
-        elif path == "/api/token":
-            tok = "hg-" + secrets.token_hex(12)
-            cfg = STORE.cfg
-            cfg["token"] = tok
-            STORE.save_cfg()
-            STORE.event("system", 0, 0, 0, "token", "接口凭证已重新生成")
-            self._json({"ok": True, "token": tok})
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch("POST")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
 
     def do_DELETE(self):
-        path, _, _ = self.path.partition("?")
-        if path.startswith("/api/blacklist/"):
-            ip = path.rsplit("/", 1)[-1]
-            sh(f"{IPS} del hfish_guard_black {ip} 2>/dev/null")
+        self._dispatch("DELETE")
+
+    def _dispatch(self, method):
+        parsed = urllib.parse.urlparse(self.path)
+        path = urllib.parse.unquote(parsed.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        try:
+            if method == "GET":
+                self._route_get(path, query)
+            elif method in ("POST", "PUT"):
+                self._route_write(method, path)
+            else:
+                self._route_delete(path)
+        except ApiError as e:
+            self._json({"error": e.message}, e.status)
+        except BrokenPipeError:
+            pass
+        except Exception as e:                            # noqa: BLE001
+            log("请求异常 %s %s：%r" % (method, path, e), "error")
+            try:
+                self._json({"error": "内部错误"}, 500)
+            except Exception:                              # noqa: BLE001
+                pass
+
+    def _route_get(self, path, query=None):
+        query = query or {}
+        first = lambda k, d="": (query.get(k) or [d])[0]      # noqa: E731
+        if path in ("/", "/web", "/web/", "/index.html"):
+            self._static("index.html")
+            return
+        if path == "/favicon.ico":
+            self._static("images/icon_64.png")
+            return
+        if path.startswith("/api/"):
+            if path == "/api/health":
+                self._json(health())
+                return
+            self._require_auth()
+            if path == "/api/status":
+                self._json(status())
+            elif path == "/api/events":
+                self._json(events(limit=first("limit", 500) or 500,
+                                  verdict=first("filter", "all") or "all",
+                                  q=first("q"), offset=first("offset", 0) or 0))
+            elif path == "/api/blacklist":
+                self._json(blacklist())
+            elif path == "/api/whitelist":
+                self._json(STORE.cfg.get("whitelist", []))
+            elif path == "/api/config":
+                self._json(public_config())
+            elif path == "/api/geo":
+                self._json(geo_lookup(ips=first("ips"), ip=first("ip")))
+            elif path == "/api/ports":
+                self._json(port_state())
+            elif path == "/api/hfish/intel":
+                api = HFISH.get("api")
+                self._json({"ok": bool(api and api.ok), "error": api.error if api else "",
+                            "last_pull": int(api.last_pull) if api else 0,
+                            "items": api.intel if api else {}})
+            else:
+                raise ApiError(404, "未知接口")
+            return
+        # 静态资源（images/* 等）
+        rel = path.lstrip("/")
+        if rel and ".." not in rel:
+            self._static(rel)
+            return
+        raise ApiError(404, "not found")
+
+    def _route_write(self, method, path):
+        # 自定义 webhook 是 HFish 主动推过来的，鉴权方式单独处理
+        if path == "/api/hfish/webhook":
+            self._webhook()
+            return
+        self._require_auth()
+        body = self._read_body()
+        if path == "/api/config":
+            cfg = STORE.apply_patch(body)
+            MONITOR.apply_all()
+            STORE.event("system", 0, 0, "config", "配置热加载",
+                        "mode=%s threshold=%s window=%s ports=%d" % (
+                            cfg["mode"], cfg["threshold"], cfg["window"], len(cfg["ports"])))
+            self._json({"ok": True, "config": public_config()})
+            return
+        if path == "/api/blacklist":
+            ip = (body.get("ip") or "").strip()
+            if not valid_ip(ip):
+                raise ApiError(400, "IP 不合法")
+            ttl = body.get("ttl", STORE.cfg.get("ttl", 3600))
+            try:
+                ttl = int(ttl)
+            except (TypeError, ValueError):
+                ttl = int(STORE.cfg.get("ttl", 3600))
+            MONITOR.kernel.add_black(ip)
+            STORE.add_block(ip, int(body.get("port") or 0), int(body.get("packets") or 0), ttl,
+                            body.get("reason") or "手动封禁")
+            STORE.event(ip, int(body.get("port") or 0), 0, "manual", "手动封禁",
+                        body.get("note") or "")
+            self._json({"ok": True, "ip": ip, "ttl": ttl})
+            return
+        if path in ("/api/blacklist/delete", "/api/blacklist/unblock"):
+            ip = (body.get("ip") or "").strip()
+            if not valid_ip(ip):
+                raise ApiError(400, "IP 不合法")
+            MONITOR.kernel.del_black(ip)
             STORE.unblock(ip)
             STORE.event(ip, 0, 0, "manual", "手动解封", "")
             self._json({"ok": True})
-        elif path.startswith("/api/whitelist/"):
-            cidr = path.rsplit("/", 1)[-1]
-            cfg = STORE.cfg
-            cfg["whitelist"] = [w for w in cfg["whitelist"] if w.get("cidr") != cidr]
+            return
+        if path == "/api/whitelist":
+            cidr = (body.get("cidr") or "").strip()
+            if not valid_cidr(cidr):
+                raise ApiError(400, "CIDR 不合法")
+            wl = STORE.cfg["whitelist"]
+            if not any(w.get("cidr") == cidr for w in wl):
+                wl.append({"cidr": cidr, "note": body.get("note") or "", "at": int(time.time())})
+                STORE.save_cfg()
+                MONITOR.apply_all()
+            self._json({"ok": True, "whitelist": wl})
+            return
+        if path == "/api/whitelist/delete":
+            cidr = (body.get("cidr") or "").strip()
+            STORE.cfg["whitelist"] = [w for w in STORE.cfg["whitelist"] if w.get("cidr") != cidr]
             STORE.save_cfg()
-            sync_whitelist(cfg["whitelist"])
+            MONITOR.apply_all()
             self._json({"ok": True})
-        else:
-            self._json({"error": "not found"}, 404)
+            return
+        if path == "/api/token":
+            tok = "hg-" + secrets.token_hex(12)
+            STORE.cfg["token"] = tok
+            STORE.save_cfg()
+            STORE.event("system", 0, 0, "token", "接口凭证已重新生成", "")
+            self._json({"ok": True, "token": tok})
+            return
+        if path == "/api/simulate":
+            # 仅 fake 内核可用：注入一次攻击流量，方便自测与演示
+            if not isinstance(MONITOR.kernel, FakeKernel):
+                raise ApiError(400, "仅 --fake 模式支持流量注入")
+            ip = (body.get("ip") or "").strip()
+            if not valid_ip(ip):
+                raise ApiError(400, "IP 不合法")
+            port = int(body.get("port") or 0)
+            packets = int(body.get("packets") or 1)
+            ok = MONITOR.kernel.hit(ip, port, packets)
+            self._json({"ok": ok, "injected": packets if ok else 0})
+            return
+        raise ApiError(404, "未知接口")
+
+    def _webhook(self):
+        """接收 HFish「告警策略 → webhook（自定义）」推来的威胁告警。"""
+        hf = STORE.cfg.get("hfish", {})
+        if not hf.get("enabled"):
+            raise ApiError(403, "HFish 联动未启用")
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        given = (query.get("k") or query.get("token")
+                 or [self.headers.get("X-Guard-Token") or ""])[0]
+        secret = hf.get("webhook_token") or ""
+        if secret:
+            if not secrets.compare_digest(given, secret):
+                raise ApiError(401, "webhook 校验串无效")
+        elif not self._authorized():
+            raise ApiError(401, "凭证无效或缺失")
+        body = self._read_body()
+        items = body.get("events") if isinstance(body.get("events"), list) else [body]
+        ingest = HFISH.get("ingest")
+        accepted = 0
+        for item in items[:200]:
+            if isinstance(item, dict) and ingest and ingest.push(item, "webhook"):
+                accepted += 1
+        self._json({"ok": True, "accepted": accepted, "received": len(items)})
+
+    def _route_delete(self, path):
+        self._require_auth()
+        if path.startswith("/api/blacklist/"):
+            ip = path[len("/api/blacklist/"):].strip()
+            if not valid_ip(ip):
+                raise ApiError(400, "IP 不合法")
+            MONITOR.kernel.del_black(ip)
+            STORE.unblock(ip)
+            STORE.event(ip, 0, 0, "manual", "手动解封", "")
+            self._json({"ok": True})
+            return
+        if path.startswith("/api/whitelist/"):
+            cidr = path[len("/api/whitelist/"):].strip()
+            if not valid_cidr(cidr):
+                raise ApiError(400, "CIDR 不合法")
+            STORE.cfg["whitelist"] = [w for w in STORE.cfg["whitelist"] if w.get("cidr") != cidr]
+            STORE.save_cfg()
+            MONITOR.apply_all()
+            self._json({"ok": True})
+            return
+        raise ApiError(404, "未知接口")
+
+
+# --------------------------------------------------------------------- 快照函数
+def public_config():
+    cfg = dict(STORE.cfg)
+    cfg["token_set"] = bool(cfg.get("token"))
+    return cfg
+
+
+def listening_ports():
+    """从 /proc/net/tcp{,6} 读 LISTEN 端口；非 Linux 返回空集合。"""
+    ports = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(name, "r", encoding="utf-8") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4 or parts[3] != "0A":
+                        continue
+                    local = parts[1]
+                    if ":" in local:
+                        ports.add(int(local.rsplit(":", 1)[1], 16))
+        except (OSError, ValueError):
+            continue
+    return ports
+
+
+def hive_info():
+    installed = any(os.path.isdir(d) for d in HIVE_DIRS)
+    return {"installed": installed, "dirs": [d for d in HIVE_DIRS if os.path.isdir(d)]}
+
+
+def hfish_link():
+    """HFish 联动状态快照，直接在 UI 的「联动」区域展示。"""
+    hf = STORE.cfg.get("hfish", {})
+    api = HFISH.get("api")
+    rec = HFISH.get("receiver")
+    ing = HFISH.get("ingest")
+    return {
+        "enabled": bool(hf.get("enabled")),
+        "syslog_port": hf.get("syslog_port"),
+        "syslog_bound": dict(rec.bound) if rec else {"udp": False, "tcp": False},
+        "api_configured": bool(hf.get("api_base") and hf.get("api_key")),
+        "api_ok": bool(api.ok) if api else False,
+        "api_error": (api.error if api else ""),
+        "last_pull": int(api.last_pull) if api else 0,
+        "intel_count": len(api.intel) if api else 0,
+        "auto_block_level": hf.get("auto_block_level") or "",
+        "received": dict(ing.counts) if ing else {},
+    }
+
+
+def port_state():
+    cfg = STORE.cfg
+    listen = listening_ports()
+    totals = STORE.kv_get("port_totals", {})
+    last = STORE.kv_get("port_last", {})
+    out = []
+    for p in cfg["ports"]:
+        key = str(p)
+        out.append({
+            "port": int(p),
+            "listening": (int(p) in listen) if listen else None,
+            "hits": int(totals.get(key, 0)),
+            "live_hits": int(MONITOR.port_hits.get(key, 0)),
+            "last": int(last.get(key, 0)) * 1000,
+            "trapped": key in MONITOR.ports_applied,
+        })
+    return out
+
+
+def health():
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "version": VERSION,
+        "auth": True,
+        "kernel": {"kind": MONITOR.kernel.kind, "available": MONITOR.kernel.available,
+                   "reason": MONITOR.kernel.reason},
+        "fake": FAKE,
+        "time": int(time.time()),
+    }
+
+
+def status():
+    cfg = STORE.cfg
+    ports = port_state()
+    return {
+        "app": APP_NAME,
+        "version": VERSION,
+        "mode": cfg["mode"],
+        "threshold": cfg["threshold"],
+        "window": cfg["window"],
+        "poll": cfg["poll"],
+        "ttl": cfg["ttl"],
+        "ports": cfg["ports"],
+        "whitelist": cfg["whitelist"],
+        "blacklist_count": len(STORE.active_blocks()),
+        "events_count": STORE.events_count("over"),
+        "trap": MONITOR.kernel.trap_present([str(p) for p in cfg["ports"]]),
+        "kernel": {"kind": MONITOR.kernel.kind, "available": MONITOR.kernel.available,
+                   "reason": MONITOR.kernel.reason},
+        "degraded": not MONITOR.kernel.available,
+        "fake": FAKE,
+        "last_poll": MONITOR.last_poll,
+        "uptime": int(time.time()) - MONITOR.started_at,
+        "total_packets": int(STORE.kv_get("total_packets", 0)),
+        "window_sum": MONITOR.window_sum(),
+        "top_src": MONITOR.top_src(),
+        "window_series": MONITOR.window_series(),
+        "per_port": STORE.kv_get("port_totals", {}),
+        "port_last": STORE.kv_get("port_last", {}),
+        "port_state": ports,
+        "link": {
+            "hive": hive_info(),
+            "hfish": hfish_link(),
+            "ports_watched": len(cfg["ports"]),
+            "ports_listening": sum(1 for p in ports if p["listening"]),
+        },
+        "geo_source": MONITOR.geo.source(),
+        "recent": [row for row in events(limit=5)],
+    }
+
+
+def events(limit=500, verdict=None, q=None, offset=0):
+    """事件列表。verdict 过滤在 SQL 之外做，方便与 UI 的筛选语义对齐。"""
+    try:
+        limit = max(1, min(2000, int(limit)))
+    except (TypeError, ValueError):
+        limit = 500
+    rows = STORE.events(limit + max(0, int(offset or 0)))
+    items = []
+    for r in rows:
+        if verdict and verdict != "all" and r[5] != verdict:
+            continue
+        if q:
+            needle = str(q).lower()
+            hay = "%s %s %s %s" % (r[2], r[3], r[5], MONITOR.geo.lookup(r[2]).get("cn", "") if r[2] else "")
+            if needle not in hay.lower():
+                continue
+        items.append(r)
+    items = items[:limit]
+    return [{
+        "id": "EV-%d" % r[0],
+        "ts": r[1] * 1000,
+        "ip": r[2],
+        "port": r[3],
+        "packets": r[4],
+        "verdict": r[5],
+        "action": r[6],
+        "detail": r[7] or "",
+        "geo": MONITOR.geo.lookup(r[2]) if r[2] else None,
+    } for r in items]
+
+
+def blacklist():
+    now = int(time.time())
+    out = []
+    for ip, ts, expire, port, packets, ttl, reason in STORE.active_blocks():
+        out.append({
+            "ip": ip,
+            "at": ts * 1000,
+            "expire": expire * 1000 if expire else 0,
+            "port": port,
+            "packets": packets,
+            # 永久封禁用 ttl=0 表示，UI 侧按 10 年渲染进度条
+            "ttl": ttl if ttl > 0 else 315360000,
+            "permanent": ttl <= 0,
+            "left": max(0, expire - now) if expire else None,
+            "reason": reason,
+            "geo": MONITOR.geo.lookup(ip),
+        })
+    return out
+
+
+def geo_lookup(ips=None, ip=""):
+    if ips:
+        return {"source": MONITOR.geo.source(),
+                "items": [MONITOR.geo.lookup(x.strip()) for x in ips.split(",")[:200] if x.strip()]}
+    return MONITOR.geo.lookup(ip)
+
+
+# --------------------------------------------------------------------- 启动
+STORE = None
+MONITOR = None
+HFISH = {}
+
+
+def serve(port=PORT):
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    srv.daemon_threads = True
+    srv.allow_reuse_address = True
+    log("接口面就绪：http://0.0.0.0:%d（%s 内核，%s）" % (
+        port, MONITOR.kernel.kind, "已挂载规则" if MONITOR.kernel.trap_present(
+            [str(p) for p in STORE.cfg["ports"]]) else "规则未生效"))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
 
 
 def poll_loop():
-    GUARD.apply_all()
     while True:
         try:
-            GUARD.poll_once()
-        except Exception as e:
+            MONITOR.poll_once()
+        except Exception as e:                            # noqa: BLE001
+            log("轮询异常：%r" % e, "error")
             try:
-                STORE.event("system", 0, 0, 0, "error", "守护异常 " + str(e)[:200])
-            except Exception:
+                STORE.event("system", 0, 0, "error", "守护异常", str(e)[:180])
+            except Exception:                              # noqa: BLE001
                 pass
-        time.sleep(int(STORE.cfg.get("poll", 10)))
+        time.sleep(max(1, int(STORE.cfg.get("poll", POLL_DEFAULT))))
 
 
-def main():
-    global STORE, GUARD
+def prune_loop():
+    while True:
+        time.sleep(600)
+        try:
+            STORE.prune()
+        except Exception as e:                            # noqa: BLE001
+            log("清理历史事件失败：%r" % e, "warn")
+
+
+def main(argv=None):
+    global BASE_DIR, CFG_PATH, DB_PATH, GEO_PATH, PORT, FAKE, STORE, MONITOR
+    parser = argparse.ArgumentParser(description="HFish Guard daemon")
+    parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--data", default=BASE_DIR)
+    parser.add_argument("--fake", action="store_true", default=FAKE,
+                        help="内存态内核 + 攻击模拟器，用于本地联调")
+    parser.add_argument("--verbose", action="store_true", default=VERBOSE)
+    args = parser.parse_args(argv)
+
+    PORT = args.port
+    BASE_DIR = os.path.abspath(args.data)
+    CFG_PATH = os.path.join(BASE_DIR, "config.json")
+    DB_PATH = os.path.join(BASE_DIR, "guard.db")
+    GEO_PATH = os.path.join(BASE_DIR, "geo.json")
+    FAKE = args.fake or FAKE
+
+    log("HFish Guard v%s 启动（数据目录 %s）" % (VERSION, BASE_DIR))
     STORE = Store()
-    GUARD = Guard(STORE)
-    GUARD.apply_all()
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("HFish Guard listening on :%d" % PORT, flush=True)
-    srv.serve_forever()
+    if FAKE:
+        kernel = FakeKernel()
+        log("内核层：fake（内存态，不触碰 iptables/ipset）", "warn")
+    else:
+        kernel = RealKernel()
+        if not kernel.available:
+            log("内核层不可用：%s —— 守护以降级模式运行（只读接口，不下发规则）" % kernel.reason, "warn")
+    MONITOR = Monitor(STORE, kernel, Geo())
+    MONITOR.apply_all()
+
+    if FAKE and SIMULATE:
+        Simulator(kernel, STORE, MONITOR).start()
+        log("攻击模拟器已启动（--fake）", "warn")
+
+    # HFish 联动：syslog 接收器（UDP/TCP）+ 开放 API 情报同步，按配置启停
+    HFISH["ingest"] = Ingest(STORE, MONITOR)
+    hf_cfg = STORE.cfg.get("hfish", {})
+    if hf_cfg.get("enabled"):
+        receiver = SyslogReceiver(hf_cfg.get("syslog_port", 5514), HFISH["ingest"])
+        receiver.start()
+        HFISH["receiver"] = receiver
+        log("HFish syslog 接收器监听 :%s（UDP/TCP）" % hf_cfg.get("syslog_port"))
+    else:
+        log("HFish 联动未启用（只用内核计数）；需要事件富化请在配置里开启 hfish.enabled")
+    api_client = HfishApi(STORE)
+    HFISH["api"] = api_client
+    if hf_cfg.get("api_key"):
+        api_client.start()
+        log("HFish 开放 API 情报同步已启动（每 60s 拉一次 /api/v1/attack/ip）")
+
+    threading.Thread(target=poll_loop, daemon=True).start()
+    threading.Thread(target=prune_loop, daemon=True).start()
+
+    def _shutdown(_signum, _frame):
+        log("收到退出信号，正在停止")
+        os._exit(0)
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _shutdown)
+            except (ValueError, OSError):
+                pass
+
+    serve(PORT)
 
 
 if __name__ == "__main__":
