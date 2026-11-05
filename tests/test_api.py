@@ -35,6 +35,31 @@ def free_port():
     return port
 
 
+def free_dual_port():
+    """取一个 TCP 与 UDP 同时空闲的端口。
+
+    syslog 接收器要同时绑 UDP 和 TCP，只验一种会被另一种占用的号坑到
+    （实测：UDP 挑中的号可能正是守护进程自己正在用的 TCP 端口，
+    结果 UDP 绑上、TCP EADDRINUSE，表现为 syslog_bound={"udp":true,"tcp":false}）。
+    """
+    for _ in range(60):
+        port = free_port()
+        ok = True
+        for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+            probe = socket.socket(socket.AF_INET, kind)
+            try:
+                probe.bind(("0.0.0.0", port))
+            except OSError:
+                ok = False
+            finally:
+                probe.close()
+            if not ok:
+                break
+        if ok:
+            return port
+    raise RuntimeError("找不到 TCP/UDP 双空闲端口")
+
+
 class ApiBase(unittest.TestCase):
     """两个测试类共用的 HTTP helper。"""
     base = ""
@@ -263,10 +288,7 @@ class HfishIngestTest(ApiBase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="hfish-guard-hf-")
         cls.port = free_port()
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind(("127.0.0.1", 0))
-        cls.syslog_port = s.getsockname()[1]
-        s.close()
+        cls.syslog_port = free_dual_port()
         cls.base = "http://127.0.0.1:%d" % cls.port
         cls.token = "hg-test-token-hf1"
         cfg = {
@@ -375,10 +397,7 @@ class HfishIngestTest(ApiBase):
 
     def test_07_syslog_rebinds_on_config_change(self):
         # UI 里改 syslog 端口必须即时生效：不重启进程也要重绑到新端口
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind(("127.0.0.1", 0))
-        new_port = s.getsockname()[1]
-        s.close()
+        new_port = free_dual_port()
         cfg = self.call("PUT", "/api/config", {"hfish": {"syslog_port": new_port}})
         self.assertEqual(cfg["config"]["hfish"]["syslog_port"], new_port)
 
@@ -410,6 +429,172 @@ class HfishIngestTest(ApiBase):
         hf = self.call("GET", "/api/status")["link"]["hfish"]
         self.assertFalse(hf["enabled"])
         self.assertFalse(hf["syslog_bound"].get("udp"), "关闭联动后应释放 syslog 端口")
+
+
+class LegacyConfigTest(ApiBase):
+    """v1.0.0 部署升级上来：旧 UI 把封禁模式写成 "block"，不能被静默降级。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="hfish-guard-legacy-")
+        cls.port = free_port()
+        cls.base = "http://127.0.0.1:%d" % cls.port
+        cls.token = "hg-test-token-legacy"
+        # 还原线上真实形态：mode=block、ports 为字符串、无 hfish 段
+        with open(os.path.join(cls.tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"mode": "block", "threshold": 40, "window": 60, "ttl": 86400,
+                       "token": cls.token,
+                       "ports": ["6379", "9200", "2022"],
+                       "whitelist": ["127.0.0.1", "192.168.110.97"]}, f)
+        env = dict(os.environ)
+        env.update({"HFISH_GUARD_FAKE": "1", "HFISH_GUARD_SIM": "0"})
+        cls.proc = subprocess.Popen(
+            [sys.executable, GUARD, "--fake", "--port", str(cls.port), "--data", cls.tmp],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if cls.call("GET", "/api/health", token=None).get("ok"):
+                    return
+            except Exception:
+                pass
+            time.sleep(0.2)
+        raise RuntimeError("守护进程未就绪")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_01_block_migrates_to_enforce(self):
+        self.assertEqual(self.call("GET", "/api/config")["mode"], "enforce")
+        self.assertEqual(self.call("GET", "/api/status")["mode"], "enforce")
+
+    def test_02_legacy_port_and_whitelist_survive(self):
+        s = self.call("GET", "/api/status")
+        self.assertEqual(s["ports"], [6379, 9200, 2022])
+        self.assertIn("192.168.110.97", [w["cidr"] for w in s["whitelist"]])
+
+    def test_03_patch_still_accepts_legacy_value(self):
+        # 旧页面缓存直接 POST block 也要落到 enforce，不能静默失败
+        self.call("PUT", "/api/config", {"mode": "observe"})
+        self.assertEqual(self.call("GET", "/api/config")["mode"], "observe")
+        self.call("PUT", "/api/config", {"mode": "block"})
+        self.assertEqual(self.call("GET", "/api/config")["mode"], "enforce")
+
+    def test_04_hfish_defaults_when_absent(self):
+        hf = self.call("GET", "/api/config")["hfish"]
+        self.assertFalse(hf["enabled"])
+        self.assertEqual(hf["syslog_port"], 5514)
+
+
+class LegacyDbTest(ApiBase):
+    """v1.0.0 的 guard.db 结构与现在完全不同，升级时必须自动补列而不是崩。
+
+    线上真实形态（fnOS 实机）：events(id, ts, ip, hits, action, detail)、
+    blocks(ip, ts, expire, reason, hits, active)，缺 port/packets/verdict/ttl。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import sqlite3
+        cls.tmp = tempfile.mkdtemp(prefix="hfish-guard-legacydb-")
+        cls.port = free_port()
+        cls.base = "http://127.0.0.1:%d" % cls.port
+        cls.token = "hg-test-token-legacydb"
+        with open(os.path.join(cls.tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"mode": "enforce", "threshold": 9999, "poll": 1,
+                       "token": cls.token, "ports": [6379], "whitelist": []}, f)
+        db = sqlite3.connect(os.path.join(cls.tmp, "guard.db"))
+        db.execute("CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, "
+                   "ip TEXT, hits INTEGER, action TEXT, detail TEXT)")
+        db.execute("CREATE TABLE blocks(ip TEXT PRIMARY KEY, ts INTEGER, expire INTEGER, "
+                   "reason TEXT, hits INTEGER, active INTEGER DEFAULT 1)")
+        db.execute("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO events(ts,ip,hits,action,detail) VALUES(1,'203.0.113.9',7,"
+                   "'自动封禁','旧版事件')")
+        db.execute("INSERT INTO blocks(ip,ts,expire,reason,hits,active) "
+                   "VALUES('203.0.113.9',1,4102444800,'旧版封禁',7,1)")
+        db.commit()
+        db.close()
+
+        env = dict(os.environ)
+        env.update({"HFISH_GUARD_FAKE": "1", "HFISH_GUARD_SIM": "0"})
+        cls.proc = subprocess.Popen(
+            [sys.executable, GUARD, "--fake", "--port", str(cls.port), "--data", cls.tmp],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if cls.call("GET", "/api/health", token=None).get("ok"):
+                    return
+            except Exception:
+                pass
+            if cls.proc.poll() is not None:
+                raise RuntimeError("迁移后进程退出：\n%s" % cls.proc.stdout.read())
+            time.sleep(0.2)
+        raise RuntimeError("守护进程未就绪（迁移可能卡住）")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_01_starts_despite_old_schema(self):
+        self.assertTrue(self.call("GET", "/api/health")["ok"])
+
+    def test_02_old_events_migrated(self):
+        rows = self.call("GET", "/api/events?limit=20")
+        old = [r for r in rows if r["ip"] == "203.0.113.9"]
+        self.assertTrue(old, "旧事件应保留")
+        self.assertEqual(old[0]["packets"], 7, "hits 应搬到 packets")
+        self.assertEqual(old[0]["port"], 0)
+
+    def test_03_old_block_migrated(self):
+        bl = self.call("GET", "/api/blacklist")
+        self.assertIn("203.0.113.9", [b["ip"] for b in bl])
+        row = [b for b in bl if b["ip"] == "203.0.113.9"][0]
+        self.assertEqual(row["packets"], 7)
+
+
+class RateSpecTest(unittest.TestCase):
+    """hashlimit 速率写法必须合法：真机上 "40/60sec" 会被直接拒掉，
+    结果是规则没挂上、以为在防护其实什么都不做。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("guard_mod", GUARD)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_units_are_valid(self):
+        rs = self.mod.rate_spec
+        self.assertEqual(rs(40, 60), "40/minute")
+        self.assertEqual(rs(100, 60), "100/minute")
+        self.assertEqual(rs(40, 300), "8/minute")
+        self.assertEqual(rs(3600, 86400), "3600/day")
+        self.assertEqual(rs(600, 3600), "600/hour")
+        self.assertEqual(rs(10, 5), "2/second")
+
+    def test_never_returns_zero_rate(self):
+        rs = self.mod.rate_spec
+        for thr, win in ((1, 3600), (1, 86400), (2, 300), (1, 1)):
+            self.assertNotIn("/0", rs(thr, win))
+            self.assertTrue(rs(thr, win).split("/")[0].isdigit())
+
+    def test_only_supported_suffixes(self):
+        rs = self.mod.rate_spec
+        for thr, win in ((40, 60), (5, 5), (900, 3600), (5000, 86400)):
+            self.assertIn(rs(thr, win).split("/", 1)[1], ("second", "minute", "hour", "day"))
 
 
 if __name__ == "__main__":

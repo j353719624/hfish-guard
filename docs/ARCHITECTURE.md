@@ -24,9 +24,9 @@
                                       │ 内核收包
                        ┌──────────────▼───────────────┐
                        │  netfilter（数据面）          │
-                       │  INPUT 陷阱规则 → ipset 计数  │
-                       │  hfish_guard_seen_<port>      │
-                       │  hfish_guard_black → DROP     │
+                       │  记名规则 → seen_<port>       │
+                       │  hashlimit 判定 → 命中池      │
+                       │  black → DROP                 │
                        └──────────────┬───────────────┘
                                       │ 每 poll 秒读 counters
                        ┌──────────────▼───────────────┐
@@ -50,10 +50,10 @@
 
 ### hfish-guard 负责
 
-- **计数**：在每个蜜罐端口上挂一条 iptables 陷阱规则，命中的源 IP 进独立 ipset（`hash:ip counters`），零日志洪水；
-- **判定**：按 `(源 IP, 端口)` 取包计数增量，滑动窗口汇总，超阈值判定为攻击；
+- **计数**：在每个蜜罐端口上挂一条陷阱规则（记名 + 规则级包计数），零日志洪水；
+- **判定**：内核 `hashlimit` 按源 IP 计速率，超过「阈值 / 窗口」即判定为攻击（不依赖用户态轮询节奏）；
 - **处置**：`enforce` 模式把源 IP 写入 `hfish_guard_black` + INPUT DROP（**全端口断网**，含 SSH/Web/文件共享）；`observe` 模式只记录；
-- **生命周期**：黑名单 TTL 到期自动解封、白名单内核侧豁免、配置热加载、事件流水留存；
+- **生命周期**：黑名单 TTL 到期由守护进程解封、白名单内核侧豁免、配置热加载、事件流水留存；
 - **可观测**：`:9705` 的 REST 接口与单页值守台。
 
 ### 边界（重要）
@@ -109,14 +109,27 @@ UI 里的地球仪落点、攻击弧线、TOP ORIGINS 全部由 `state.events` �
 
 ## 5. 数据流与判定细节
 
-1. 内核：`iptables -I INPUT -p tcp --dport <port> -m set ! --match-set hfish_guard_white src -j SET --add-set hfish_guard_seen_<port> src`
-   → 白名单在**内核侧**就被排除，自家扫描不会进计数，也不会产生日志洪水。
-2. `guard.py` 每 `poll` 秒 `ipset list` 读 `packets` 计数，取增量（同 IP 同端口）。
-3. 增量累加到 `(ip, port, slot)` 分桶，`slot = now // window`，只保留最近两个窗口。
-4. 每个槽内按 IP 汇总；`>= threshold` 且该槽未告警过 → 判定一次（防重复刷屏）。
-5. `enforce`：写 `hfish_guard_black` + `blocks` 表（含 `expire`），并清掉该 IP 的 seen 成员与分桶；`observe`：只写 `events`。
-6. 每 15 秒检查一次 TTL，到期 `ipset del` + `active=0` + 记 `expired` 事件。
-7. 配置 PUT 后立即重挂规则、重刷白名单，不重启进程。
+**判定在内核，记录在用户态。** 每个蜜罐端口挂两条规则（外加一条全局 DROP）：
+
+1. 记名规则
+   `-p tcp --dport <p> -m set ! --match-set hfish_guard_white src -j SET --add-set hfish_guard_seen_<p> src`
+   → 白名单在**内核侧**就被排除，自家扫描不计包、不出事件；同时这条规则自己的包计数器就是该端口的真实流量。
+2. 判定规则
+   `-m hashlimit --hashlimit-name hg<p> --hashlimit-mode srcip --hashlimit-above <阈值>/<窗口> --hashlimit-burst <阈值> -j SET --add-set <命中池> src`
+   → 同一源 IP 在窗口内超过阈值即命中，直接由内核写入命中池：
+   `enforce` 写 `hfish_guard_black`（再跟一条同参数的 `-j DROP` 立刻掐掉触发包，后续包由顶部黑名单 DROP 拦住）；`observe` 写 `hfish_guard_alert`。
+3. `guard.py` 每 `poll` 秒读两样东西：
+   - 各端口规则的包计数器（`iptables -vnxL INPUT` 的精确值）→ 增量进 `series`、`port_hits`、`port_totals`，这是态势曲线的数据源；
+   - 命中池：`black` 里数据库还没有的成员 → `blocks` 表 + `events`（`自动封禁`）；`alert` 成员 → `events`（`观察记录`）后立刻清空，允许下一窗口再次触发。
+4. 端口归属：事件里的「目标端口」由 `seen_<p>` 集合反查（该源碰过哪个蜜罐端口）。
+5. TTL：每 15 秒检查 `blocks.expire`，到期 `ipset del` + `active=0` + 记 `expired` 事件（**解封由用户态执行**，不依赖 ipset 自身的 timeout，保证数据库与内核状态一致）。
+6. 配置 PUT 后立即重下发规则、重刷白名单，不重启进程。
+
+### 为什么不用 ipset 的 packets 计数器（真机实测）
+
+早期版本轮询每个成员的 `packets` 做增量，在开发机（fake 内核）上一切正常，真机上**永远不触发**：ipset 的包计数器只在条目被创建时记 1，之后同源包不再累加——`ipset add -exist` 反复加同一个 IP，`packets` 仍然停在 1（实测 ipset 7.17 + kernel 6.18）。也就是说「计数器增量」这条路拿不到真实包数，阈值永远够不到。
+
+v1.3 起改为 `hashlimit` 内核判定：语义上就是「同一源 IP 超过 N 包/窗口就命中」，比用户态轮询更即时（不等 poll 周期），也不怕高频扫描把事件刷爆。代价是事件里不再有「精确到包」的数值，`packets` 字段记录的是触发阈值；真实流量曲线仍由规则计数器给出。
 
 事件表只保留最近 20000 行（后台线程每 10 分钟裁一次）。`verdict` 取值：`over`（超阈值）/ `manual`（手动处置）/ `expired`（TTL 到期）/ 以及不入列表的 `config`/`token`/`system`/`error`。
 

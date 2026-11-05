@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import socket
 import sqlite3
@@ -42,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -72,7 +73,15 @@ HIVE_DIRS = ("/vol2/@appcenter/hive", "/var/apps/hive")
 SEEN_PREFIX = "hfish_guard_seen_"
 SET_WHITE = "hfish_guard_white"
 SET_BLACK = "hfish_guard_black"
-SEEN_TIMEOUT = 300                      # ipset 成员兜底过期时间（秒）
+SET_ALERT = "hfish_guard_alert"     # 观察模式下内核判定的命中池
+SEEN_TIMEOUT = 300                      # seen 集合成员兜底过期时间（秒）
+ALERT_TIMEOUT = 900                     # 观察命中池保留时长（供用户态取走事件）
+
+# 旧版本（v1.0.0 的 UI 与接口）用过这些取值，升级时映射到当前语义，
+# 避免已部署的配置被静默降级成 observe（旧 UI 的「封禁模式」= block）
+LEGACY_MODE = {"block": "enforce", "ban": "enforce", "drop": "enforce",
+               "enforcing": "enforce", "record": "observe",
+               "monitor": "observe", "log": "observe"}
 
 DEFAULT_CONFIG = {
     "mode": "observe",                  # observe | enforce
@@ -162,6 +171,21 @@ def set_name(port):
     return "%s%s" % (SEEN_PREFIX, port)
 
 
+def rate_spec(threshold, window):
+    """把「threshold 包 / window 秒」翻译成 hashlimit 认的速率写法。
+
+    iptables 只接受 /second /minute /hour /day 这几种单位，
+    写 "40/60sec" 会直接 hashlimit: Bad value 被拒。
+    """
+    threshold = max(1, int(threshold))
+    window = max(1, int(window))
+    for unit, secs in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if window >= secs:
+            amount = int(round(threshold * secs / float(window)))
+            return "%d/%s" % (max(1, amount), unit)
+    return "%d/second" % max(1, int(round(threshold / float(window))))
+
+
 class Whitelist:
     """CIDR 匹配缓存；每次热加载重建，避免轮询里反复解析。"""
 
@@ -192,7 +216,15 @@ class Whitelist:
 
 # --------------------------------------------------------------------- 内核层
 class RealKernel:
-    """ipset + iptables 真实实现。"""
+    """ipset + iptables 真实实现。
+
+    判定放在内核里：每个蜜罐端口两条规则
+      1) 记名：命中的源 IP 进 seen_<port>（白名单在内核侧豁免），用于事件归属端口
+      2) 判定：-m hashlimit 按源 IP 计速率，超过 threshold/window 就写命中池
+              （enforce 直接写 black，observe 写 alert 供用户态记录）
+    为什么不用 ipset 的 packets 计数：真机实测该计数器只在条目创建时记 1，
+    后续同源包不累加（`ipset add -exist` 也保持 0），拿它做增量永远是 1。
+    """
 
     kind = "netfilter"
 
@@ -216,9 +248,10 @@ class RealKernel:
     # -- 集合
     def ensure_sets(self, ports):
         for p in ports:
-            sh("%s create %s hash:ip counters timeout %d -exist" % (IPS, set_name(p), SEEN_TIMEOUT))
+            sh("%s create %s hash:ip timeout %d -exist" % (IPS, set_name(p), SEEN_TIMEOUT))
         sh("%s create %s hash:ip -exist" % (IPS, SET_WHITE))
         sh("%s create %s hash:ip -exist" % (IPS, SET_BLACK))
+        sh("%s create %s hash:ip timeout %d -exist" % (IPS, SET_ALERT, ALERT_TIMEOUT))
 
     def members(self, port):
         rc, out = sh("%s list %s" % (IPS, set_name(port)))
@@ -233,13 +266,7 @@ class RealKernel:
             if not in_members or not s:
                 continue
             parts = s.split()
-            pk = 0
-            if "packets" in parts:
-                try:
-                    pk = int(parts[parts.index("packets") + 1])
-                except (ValueError, IndexError):
-                    pk = 0
-            result[parts[0]] = pk
+            result[parts[0]] = 0
         return result
 
     def del_member(self, port, ip):
@@ -248,7 +275,7 @@ class RealKernel:
     def destroy_set(self, port):
         sh("%s destroy %s 2>/dev/null" % (IPS, set_name(port)))
 
-    # -- 黑名单
+    # -- 黑名单 / 命中池
     def add_black(self, ip):
         return sh("%s add %s %s -exist" % (IPS, SET_BLACK, ip))[0] == 0
 
@@ -257,6 +284,12 @@ class RealKernel:
 
     def black_members(self):
         return set(self.members_raw(SET_BLACK))
+
+    def alert_members(self):
+        return set(self.members_raw(SET_ALERT))
+
+    def del_alert(self, ip):
+        sh("%s del %s %s 2>/dev/null" % (IPS, SET_ALERT, ip))
 
     def members_raw(self, name):
         rc, out = sh("%s list %s" % (IPS, name))
@@ -272,7 +305,7 @@ class RealKernel:
                 ips.append(s.split()[0])
         return ips
 
-    # -- 白名单 / 陷阱
+    # -- 白名单
     def sync_whitelist(self, entries):
         sh("%s flush %s" % (IPS, SET_WHITE))
         for e in entries:
@@ -280,34 +313,100 @@ class RealKernel:
             if cidr:
                 sh("%s add %s %s -exist 2>/dev/null" % (IPS, SET_WHITE, cidr))
 
-    def trap_rule(self, port, op):
-        # 白名单在内核侧豁免：命中白名单的源根本不进 seen 集合
-        return ("%s %s INPUT -p tcp --dport %s -m set ! --match-set %s src "
-                "-j SET --add-set %s src" % (IPT, op, port, SET_WHITE, set_name(port)))
+    # -- 规则
+    def seen_rule(self, port):
+        """记名规则：白名单在内核侧豁免，命中白名单的源根本进不了 seen。"""
+        return ("-p tcp --dport %s -m set ! --match-set %s src "
+                "-j SET --add-set %s src" % (port, SET_WHITE, set_name(port)))
 
-    def drop_rule(self, op):
-        return "%s %s INPUT -m set --match-set %s src -j DROP" % (IPT, op, SET_BLACK)
+    def hlimit_rule(self, port, threshold, window, target):
+        """判定规则：同一源 IP 在 window 秒内超过 threshold 个包即命中。"""
+        rate = rate_spec(threshold, window)
+        return ("-p tcp --dport %s -m set ! --match-set %s src "
+                "-m hashlimit --hashlimit-name hg%s --hashlimit-mode srcip "
+                "--hashlimit-above %s --hashlimit-burst %d "
+                "--hashlimit-htable-expire %d --hashlimit-htable-size 2048 "
+                "-j SET --add-set %s src" % (port, SET_WHITE, port, rate,
+                                             threshold, window * 2000, target))
 
-    def apply_traps(self, ports, prev_ports=()):
+    def hlimit_drop(self, port, threshold, window):
+        rate = rate_spec(threshold, window)
+        return ("-p tcp --dport %s -m set ! --match-set %s src "
+                "-m hashlimit --hashlimit-name hg%s --hashlimit-mode srcip "
+                "--hashlimit-above %s --hashlimit-burst %d "
+                "--hashlimit-htable-expire %d --hashlimit-htable-size 2048 -j DROP"
+                % (port, SET_WHITE, port, rate, threshold, window * 2000))
+
+    def drop_rule(self):
+        return "-m set --match-set %s src -j DROP" % SET_BLACK
+
+    def flush_ours(self):
+        """删掉本应用在 INPUT 上的全部规则（含旧版本留下的），保证重下发幂等。"""
+        rc, out = sh("%s -S INPUT" % IPT)
+        if rc != 0:
+            return
+        for line in out.splitlines():
+            if not line.startswith("-A "):
+                continue
+            if "hfish_guard_" not in line and "hashlimit-name hg" not in line:
+                continue
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                continue
+            parts[0] = "-D"
+            sh("%s %s 2>/dev/null" % (IPT, " ".join(parts)))
+
+    def apply_traps(self, ports, prev_ports=(), threshold=40, window=60, mode="observe"):
         self.ensure_sets(ports)
         for p in prev_ports:
             if p not in ports:
-                sh(self.trap_rule(p, "-D") + " 2>/dev/null")
                 self.destroy_set(p)
+        self.flush_ours()
+        target = SET_BLACK if mode == "enforce" else SET_ALERT
         for p in ports:
-            if sh(self.trap_rule(p, "-C") + " 2>/dev/null")[0] != 0:
-                sh(self.trap_rule(p, "-I"))
-        if sh(self.drop_rule("-C") + " 2>/dev/null")[0] != 0:
-            sh(self.drop_rule("-I"))
+            for spec in [self.seen_rule(p), self.hlimit_rule(p, threshold, window, target)] + \
+                        ([self.hlimit_drop(p, threshold, window)] if mode == "enforce" else []):
+                rc, out = sh("%s -I INPUT %s" % (IPT, spec))
+                if rc != 0:                       # 规则没挂上就等于没防护，必须可见
+                    log("下发规则失败（端口 %s）：%s" % (p, (out or "").strip()[:160]), "error")
+        # 黑名单 DROP 永远压在最前面
+        sh("%s -I INPUT 1 %s" % (IPT, self.drop_rule()))
 
     def trap_present(self, ports):
         if not ports:
             return False
-        return all(sh(self.trap_rule(p, "-C") + " 2>/dev/null")[0] == 0 for p in ports)
+        rc, out = sh("%s -S INPUT" % IPT)
+        if rc != 0:
+            return False
+        return all(("hfish_guard_seen_%s " % p) in out for p in ports)
+
+    # -- 读计数：每条端口规则自己的包计数器（-x 精确值）
+    def port_counters(self, ports):
+        rc, out = sh("%s -vnxL INPUT" % IPT)
+        if rc != 0:
+            return {}
+        result = {}
+        for line in out.splitlines():
+            m = re.search(r"--add-set (hfish_guard_seen_\d+) src", line) or \
+                re.search(r"add-set (hfish_guard_seen_\d+) src", line)
+            if not m:
+                continue
+            port = m.group(1).rsplit("_", 1)[-1]
+            parts = line.split()
+            try:
+                result[port] = result.get(port, 0) + int(parts[0])
+            except (IndexError, ValueError):
+                continue
+        return result
 
 
 class FakeKernel:
-    """内存态内核：没有 ipset/iptables 也能跑通整条判定链路（本地联调 / 单测）。"""
+    """内存态内核：没有 ipset/iptables 也能跑通整条判定链路（本地联调 / 单测）。
+
+    行为与 RealKernel 对齐：按 (端口, 源 IP) 累计包数，超过阈值就写命中池
+    （enforce 写 black，observe 写 alert），白名单与已封禁源不计数。
+    """
 
     kind = "fake"
     available = True
@@ -315,29 +414,42 @@ class FakeKernel:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.seen = {}      # port -> {ip: packets}
+        self.seen = {}          # port -> {ip: 1}
+        self.traffic = {}       # port -> 累计包数（等价于规则计数器）
+        self.hits = {}          # (port, ip) -> 窗口内包数
         self.white = set()
         self.white_net = Whitelist([])
         self.black = set()
+        self.alert = set()
         self.traps = set()
+        self.threshold = 40
+        self.window = 60
+        self.mode = "observe"
 
     # -- 用于模拟器 / 自测注入
     def hit(self, ip, port, packets=1):
         with self._lock:
             if ip in self.white_net or ip in self.black:
                 return False
-            bucket = self.seen.setdefault(str(port), {})
-            bucket[ip] = bucket.get(ip, 0) + max(1, int(packets))
+            p = str(port)
+            packets = max(1, int(packets))
+            self.seen.setdefault(p, {})[ip] = 1
+            self.traffic[p] = self.traffic.get(p, 0) + packets
+            key = (p, ip)
+            self.hits[key] = self.hits.get(key, 0) + packets
+            if self.hits[key] > self.threshold:
+                (self.black if self.mode == "enforce" else self.alert).add(ip)
             return True
 
     def ensure_sets(self, ports):
         with self._lock:
             for p in ports:
                 self.seen.setdefault(str(p), {})
+                self.traffic.setdefault(str(p), 0)
 
     def members(self, port):
         with self._lock:
-            return dict(self.seen.get(str(port), {}))
+            return {ip: 0 for ip in self.seen.get(str(port), {})}
 
     def del_member(self, port, ip):
         with self._lock:
@@ -346,6 +458,8 @@ class FakeKernel:
     def destroy_set(self, port):
         with self._lock:
             self.seen.pop(str(port), None)
+            self.traffic.pop(str(port), None)
+            self.hits = {k: v for k, v in self.hits.items() if k[0] != str(port)}
 
     def add_black(self, ip):
         with self._lock:
@@ -360,22 +474,41 @@ class FakeKernel:
         with self._lock:
             return set(self.black)
 
+    def alert_members(self):
+        with self._lock:
+            return set(self.alert)
+
+    def del_alert(self, ip):
+        with self._lock:
+            self.alert.discard(ip)
+        return True
+
     def sync_whitelist(self, entries):
         with self._lock:
             self.white = set(e.get("cidr") if isinstance(e, dict) else e for e in entries)
             self.white_net = Whitelist(entries)
 
-    def apply_traps(self, ports, prev_ports=()):
+    def apply_traps(self, ports, prev_ports=(), threshold=40, window=60, mode="observe"):
         with self._lock:
+            self.threshold = max(1, int(threshold))
+            self.window = max(5, int(window))
+            self.mode = mode if mode in ("observe", "enforce") else "observe"
             for p in prev_ports:
                 if p not in ports:
                     self.seen.pop(str(p), None)
+                    self.traffic.pop(str(p), None)
             for p in ports:
                 self.seen.setdefault(str(p), {})
+                self.traffic.setdefault(str(p), 0)
             self.traps = set(str(p) for p in ports)
+            self.hits = {}
 
     def trap_present(self, ports):
         return bool(ports) and all(str(p) in self.traps for p in ports)
+
+    def port_counters(self, ports):
+        with self._lock:
+            return {str(p): int(self.traffic.get(str(p), 0)) for p in ports}
 
 
 # --------------------------------------------------------------------- 存储层
@@ -401,8 +534,53 @@ class Store:
                 ip TEXT PRIMARY KEY, ts INTEGER, expire INTEGER, port INTEGER,
                 packets INTEGER, ttl INTEGER, reason TEXT, active INTEGER DEFAULT 1)""")
             self.db.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
+            self._migrate_db()
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ip ON events(ip)")
+
+    def _migrate_db(self):
+        """把旧版本（v1.0.0 及更早）的库结构补齐到当前版本。
+
+        v1.0.0 的两张表字段完全不同：
+            events(id, ts, ip, hits, action, detail)
+            blocks(ip, ts, expire, reason, hits, active)
+        直接升级会让所有查询报 "no such column: port" 把进程崩掉，
+        所以这里按缺失列补齐，并把旧列 hits 的数值搬到 packets。
+        """
+        want = {
+            "events": [("port", "INTEGER DEFAULT 0"), ("packets", "INTEGER DEFAULT 0"),
+                       ("verdict", "TEXT DEFAULT ''"), ("action", "TEXT DEFAULT ''"),
+                       ("detail", "TEXT DEFAULT ''"), ("ts", "INTEGER DEFAULT 0")],
+            "blocks": [("ts", "INTEGER DEFAULT 0"), ("expire", "INTEGER DEFAULT 0"),
+                       ("port", "INTEGER DEFAULT 0"), ("packets", "INTEGER DEFAULT 0"),
+                       ("ttl", "INTEGER DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
+                       ("active", "INTEGER DEFAULT 1")],
+        }
+        for table, cols in want.items():
+            try:
+                have = {row[1] for row in self.db.execute("PRAGMA table_info(%s)" % table)}
+            except sqlite3.Error as e:
+                log("探查表结构失败 %s：%r" % (table, e), "warn")
+                continue
+            if not have:
+                continue
+            added = []
+            for name, decl in cols:
+                if name in have:
+                    continue
+                try:
+                    self.db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, decl))
+                    added.append(name)
+                except sqlite3.Error as e:
+                    log("补列失败 %s.%s：%r" % (table, name, e), "warn")
+            # 旧列名 hits 等价于现在的 packets
+            if "hits" in have and "packets" in added:
+                try:
+                    self.db.execute("UPDATE %s SET packets=COALESCE(hits,0)" % table)
+                except sqlite3.Error:
+                    pass
+            if added:
+                log("数据库结构已升级：%s 新增列 %s" % (table, ",".join(added)), "warn")
 
     # -- 配置
     def _write_cfg(self, cfg):
@@ -427,6 +605,10 @@ class Store:
         cfg["ports"] = normalize_ports(cfg["ports"])
         cfg["whitelist"] = normalize_whitelist(cfg["whitelist"])
         cfg["hfish"] = normalize_hfish(cfg.get("hfish"))
+        # 旧版（v1.0.0 UI）把封禁模式写成 "block"，升级时必须迁移，
+        # 否则会被静默降级成 observe，用户的封禁设置悄悄失效
+        cfg["mode"] = LEGACY_MODE.get(str(cfg.get("mode") or "").strip().lower(),
+                                      cfg.get("mode"))
         if cfg["mode"] not in ("observe", "enforce"):
             cfg["mode"] = "observe"
         return cfg
@@ -453,8 +635,10 @@ class Store:
                     continue
                 if lo <= val <= hi:
                     cfg[key] = val
-        if body.get("mode") in ("observe", "enforce"):
-            cfg["mode"] = body["mode"]
+        want = LEGACY_MODE.get(str(body.get("mode") or "").strip().lower(),
+                               body.get("mode"))
+        if want in ("observe", "enforce"):
+            cfg["mode"] = want
         if isinstance(body.get("hfish"), dict):
             merged = dict(cfg.get("hfish") or {})
             merged.update(body["hfish"])
@@ -790,7 +974,7 @@ class Ingest:
             self.monitor.kernel.add_black(ip)
             self.store.add_block(ip, data.get("port") or 0, data.get("count") or 0,
                                  cfg.get("ttl", 3600), "HFish %s 级告警" % (level or "high"))
-            self.monitor.prev = {k: v for k, v in self.monitor.prev.items() if k[1] != ip}
+            self.monitor.forget(ip)
             action = "自动封禁（HFish 告警）"
             log("HFish 高危告警，封禁 %s（%s / %s）" % (ip, data.get("attack_type"), data.get("pot")), "warn")
 
@@ -980,15 +1164,19 @@ class HfishApi(threading.Thread):
 
 # --------------------------------------------------------------------- 控制面
 class Monitor:
+    """控制面：读内核计数做流量统计，读命中池做事件记录与 TTL 处置。
+
+    判定已下沉到内核（hashlimit），用户态不再算阈值——因为 ipset 的
+    packets 计数器只在条目创建时记 1，靠它算增量在真机上永远拿不到真实包数。
+    """
+
     def __init__(self, store, kernel, geo):
         self.store = store
         self.kernel = kernel
         self.geo = geo
-        self.prev = {}              # (port, ip) -> 上次 packets 计数
-        self.buckets = {}           # (ip, port, slot) -> 窗口内包数
-        self.alerted = set()        # (ip, slot) 已判定过，避免同一窗口重复记录
-        self.series = []            # [(ts, delta)] 最近 N 次轮询的全局增量
-        self.port_hits = {}         # port -> 累计（本次启动以来）
+        self.prev = {}              # port -> 上次规则包计数
+        self.series = []            # [(ts, delta)] 最近若干次轮询的全局增量
+        self.port_hits = {}         # port -> 本次启动以来累计
         self.ports_applied = []
         self.last_poll = 0
         self.last_expire = 0
@@ -996,18 +1184,23 @@ class Monitor:
         self.window = int(store.cfg.get("window", 60))
         self.poll_interval = int(store.cfg.get("poll", POLL_DEFAULT))
         self.last_error = ""
+        self.alert_last = {}        # ip -> 上次记录观察事件的时间（去抖）
+        self.recent_hits = []       # [(ts, ip)] 最近命中（供 top_src 用）
+        self.whitelist = Whitelist(store.cfg.get("whitelist"))
         self.stats = {"polls": 0, "blocked": 0, "events": 0}
 
     # -- 规则下发
     def apply_all(self):
         cfg = self.store.cfg
         ports = [str(p) for p in cfg["ports"]]
+        self.reload_runtime()
         self.kernel.ensure_sets(ports)
         self.kernel.sync_whitelist(cfg["whitelist"])
-        self.kernel.apply_traps(ports, self.ports_applied)
+        self.kernel.apply_traps(ports, self.ports_applied,
+                                threshold=int(cfg.get("threshold", 40)),
+                                window=self.window, mode=cfg.get("mode", "observe"))
         self.ports_applied = list(ports)
-        self.reload_runtime()
-        # 重启后把仍然有效的封禁重新写回内核集合（幂等）
+        # 重启后把仍有效的封禁写回内核（幂等），并作为基线避免重复出事件
         for row in self.store.active_blocks():
             self.kernel.add_black(row[0])
 
@@ -1022,53 +1215,31 @@ class Monitor:
         cfg = self.store.cfg
         ports = [str(p) for p in cfg["ports"]]
         now = int(time.time())
-        slot = now // self.window
         threshold = int(cfg.get("threshold", 40))
         self.last_poll = now
         self.stats["polls"] += 1
-        total_delta = 0
-        per_ip = {}
-        per_port = {}
-        blocked = self.blocked            # 一次查询，避免每个 IP 都打一次 sqlite
 
+        counters = self.kernel.port_counters(ports) or {}
+        total_delta, per_port = 0, {}
         for port in ports:
-            members = self.kernel.members(port) or {}
-            for ip, pk in members.items():
-                key = (port, ip)
-                prev = self.prev.get(key)
-                delta = pk - prev if (prev is not None and pk >= prev) else pk
-                self.prev[key] = pk
-                if delta <= 0:
-                    continue
-                if ip in self.whitelist:
-                    continue
-                # 已封禁的 IP 不再计数，避免封禁期间刷屏
-                if ip in blocked:
-                    continue
-                self.buckets[(ip, port, slot)] = self.buckets.get((ip, port, slot), 0) + delta
-                per_ip[ip] = per_ip.get(ip, 0) + delta
-                per_port[port] = per_port.get(port, 0) + delta
-                self.port_hits[port] = self.port_hits.get(port, 0) + delta
-                total_delta += delta
-
-        # 清理已消失的成员，防止 prev 无限增长
-        live = set()
-        for port in ports:
-            for ip in (self.kernel.members(port) or {}):
-                live.add((port, ip))
-        if live:
-            self.prev = {k: v for k, v in self.prev.items() if k in live or k[1] in blocked}
-
-        # 清理 2 个窗口以前的分桶
-        if self.buckets:
-            self.buckets = {k: v for k, v in self.buckets.items() if k[2] >= slot - 1}
-        self.alerted = set(a for a in self.alerted if a[1] >= slot)
+            cur = int(counters.get(port, 0))
+            prev = self.prev.get(port)
+            self.prev[port] = cur
+            if prev is None:            # 首次见到，只做基线，不当作流量
+                continue
+            delta = cur - prev if cur >= prev else cur    # 规则被重下发后计数归零
+            if delta <= 0:
+                continue
+            per_port[port] = delta
+            total_delta += delta
+            self.port_hits[port] = self.port_hits.get(port, 0) + delta
 
         self.series.append((now, total_delta))
-        self.series = self.series[-120:]
+        self.series = self.series[-240:]
 
         if total_delta:
-            self.store.kv_set("total_packets", int(self.store.kv_get("total_packets", 0)) + total_delta)
+            self.store.kv_set("total_packets",
+                              int(self.store.kv_get("total_packets", 0)) + total_delta)
             totals = self.store.kv_get("port_totals", {})
             last = self.store.kv_get("port_last", {})
             for port, delta in per_port.items():
@@ -1077,47 +1248,78 @@ class Monitor:
             self.store.kv_set("port_totals", totals)
             self.store.kv_set("port_last", last)
 
-        self.judge(slot, threshold)
+        self.collect_blocks(now, threshold)
+        self.collect_alerts(now, threshold)
         self.expire_blocks(now)
+        cut = now - self.window
+        self.recent_hits = [h for h in self.recent_hits if h[0] >= cut][-200:]
+        self.alert_last = {k: v for k, v in self.alert_last.items() if now - v < self.window}
 
-    # -- 判定与执行
-    def judge(self, slot, threshold):
+    def port_map(self, ports):
+        """IP -> 端口：靠 seen 集合归属，事件里显示「打了哪个端口」。"""
+        out = {}
+        for p in ports:
+            try:
+                for ip in (self.kernel.members(p) or {}):
+                    out.setdefault(ip, int(p))
+            except Exception:                                # noqa: BLE001
+                continue
+        return out
+
+    # -- 内核已判定封禁的 IP：落库 + 记事件（TTL 由用户态管）
+    def collect_blocks(self, now, threshold):
         cfg = self.store.cfg
-        mode = cfg.get("mode", "observe")
         ttl = int(cfg.get("ttl", 3600))
-        window_sum = {}
-        top_port = {}
-        for (ip, port, s), value in self.buckets.items():
-            if s != slot:
+        ports = [str(p) for p in cfg["ports"]]
+        try:
+            cur = self.kernel.black_members()
+        except Exception:                                    # noqa: BLE001
+            return
+        known = self.blocked
+        new = cur - known
+        if not new:
+            return
+        port_of = self.port_map(ports)
+        for ip in new:
+            if ip in self.whitelist:
+                self.kernel.del_black(ip)
                 continue
-            window_sum[ip] = window_sum.get(ip, 0) + value
-            if value > top_port.get(ip, (0, 0))[1]:
-                top_port[ip] = (port, value)
+            port = int(port_of.get(ip, 0) or 0)
+            self.store.add_block(ip, port, threshold, ttl, "内核 hashlimit 判定")
+            self.store.event(ip, port, threshold, "over", "自动封禁",
+                             "内核判定 ≥%d 包/%ds（hashlimit）" % (threshold, self.window))
+            self.stats["blocked"] += 1
+            self.recent_hits.append((now, ip))
+            log("封禁 %s（内核判定 ≥%d 包/%ds，端口 %s）" % (ip, threshold, self.window, port or "-"),
+                "warn")
 
-        for ip, total in window_sum.items():
-            if total < threshold:
+    # -- 观察模式：内核只写命中池，用户态取走记录后清掉，允许再次触发
+    def collect_alerts(self, now, threshold):
+        try:
+            ips = self.kernel.alert_members()
+        except Exception:                                    # noqa: BLE001
+            return
+        if not ips:
+            return
+        ports = [str(p) for p in self.store.cfg["ports"]]
+        port_of = self.port_map(ports)
+        for ip in ips:
+            self.kernel.del_alert(ip)
+            if ip in self.whitelist:
                 continue
-            if (ip, slot) in self.alerted:
+            if now - self.alert_last.get(ip, 0) < self.window:
                 continue
-            self.alerted.add((ip, slot))
-            port = int(top_port.get(ip, (0, 0))[0] or 0)
-            if mode == "enforce":
-                self.kernel.add_black(ip)
-                self.store.add_block(ip, port, total, ttl, "超阈值自动封禁")
-                self.store.event(ip, port, total, "over", "自动封禁",
-                                 "滑动窗口 %ds / 阈值 %d" % (self.window, threshold))
-                self.stats["blocked"] += 1
-                log("封禁 %s（%d 包 / %ds，端口 %s）" % (ip, total, self.window, port), "warn")
-                # 清零该 IP 的计数，防止解封后立刻二次触发
-                for p in [str(x) for x in cfg["ports"]]:
-                    self.kernel.del_member(p, ip)
-                self.prev = {k: v for k, v in self.prev.items() if k[1] != ip}
-                self.buckets = {k: v for k, v in self.buckets.items() if k[0] != ip}
-            else:
-                self.store.event(ip, port, total, "over", "观察记录",
-                                 "滑动窗口 %ds / 阈值 %d" % (self.window, threshold))
-                self.stats["events"] += 1
-                log("命中阈值 %s（%d 包 / %ds）观察模式仅记录" % (ip, total, self.window))
+            self.alert_last[ip] = now
+            port = int(port_of.get(ip, 0) or 0)
+            self.store.event(ip, port, threshold, "over", "观察记录",
+                             "内核判定 ≥%d 包/%ds（hashlimit，仅记录）" % (threshold, self.window))
+            self.stats["events"] += 1
+            self.recent_hits.append((now, ip))
+            log("命中阈值 %s（内核判定，端口 %s）观察模式仅记录" % (ip, port or "-"))
+
+    def forget(self, ip):
+        """外部（如 HFish 告警）处置后，清掉该 IP 的去抖状态。"""
+        self.alert_last.pop(ip, None)
 
     # -- TTL 过期
     def expire_blocks(self, now):
@@ -1140,20 +1342,14 @@ class Monitor:
         return [[ts, delta] for ts, delta in self.series[-60:]]
 
     def window_sum(self):
-        slot = int(time.time()) // self.window
-        out = {}
-        for (ip, _port, s), value in self.buckets.items():
-            if s == slot:
-                out[ip] = out.get(ip, 0) + value
-        return sum(out.values())
+        cut = int(time.time()) - self.window
+        return sum(d for ts, d in self.series if ts >= cut)
 
     def top_src(self):
-        slot = int(time.time()) // self.window
-        out = {}
-        for (ip, _port, s), value in self.buckets.items():
-            if s == slot:
-                out[ip] = out.get(ip, 0) + value
-        return max(out.values()) if out else 0
+        cut = int(time.time()) - self.window
+        if any(ts >= cut for ts, _ip in self.recent_hits):
+            return int(self.store.cfg.get("threshold", 40))
+        return max([d for ts, d in self.series if ts >= cut] or [0])
 
 
 # --------------------------------------------------------------------- 模拟器

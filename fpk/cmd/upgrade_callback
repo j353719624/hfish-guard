@@ -5,6 +5,16 @@ BIN=/vol2/@appcenter/hfish-guard/bin
 DATA=/vol2/@appdata/hfish-guard
 UNIT=/etc/systemd/system/hfish-guard.service
 
+# 0) 依赖检查：fnOS 默认不带 ipset（内核 ip_set 模块倒是有），
+#    缺了它守卫只能降级成只读。装不上就明确记日志，不阻断安装。
+if [ ! -x /usr/sbin/ipset ] && [ ! -x /sbin/ipset ] && [ ! -x /usr/bin/ipset ]; then
+  echo "hfish-guard: 未找到 ipset，尝试安装" >&2
+  DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y ipset >/dev/null 2>&1 || true
+  if ! command -v ipset >/dev/null 2>&1; then
+    echo "hfish-guard: ipset 仍不可用，守护将以降级模式运行（只读，不下发规则）" >&2
+  fi
+fi
+
 chmod 755 "${BIN}/guard.py" 2>/dev/null || true
 mkdir -p "${DATA}"
 

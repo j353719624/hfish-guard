@@ -1625,7 +1625,7 @@ select.input{background-color:rgba(3,12,24,.72)}
                   <div><div class="hp-label">攻击链路</div><div class="hp-num" style="font-size:19px" id="mapArcs">0</div></div>
                 </div>
                 <div class="wave-rule"></div>
-                <div class="hp-note">数据面 ipset counters → 控制面滑动窗口 → 接口面投影</div>
+                <div class="hp-note">数据面 hashlimit 判定 → 控制面事件与 TTL → 接口面投影</div>
               </div>
 
               <div class="ht-right">
@@ -1776,12 +1776,12 @@ select.input{background-color:rgba(3,12,24,.72)}
           <div class="kpi">
             <div class="kpi-label">累计触碰包数</div>
             <div class="kpi-row"><div class="kpi-num" id="kpiPackets">0</div><svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><polyline points="0,27 9,24 18,25 27,19 36,21 45,15 54,17 63,11 72,13 81,7 90,9 100,4" fill="none" stroke="#E8A33D" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg></div>
-            <div class="kpi-foot"><span class="tag tag--green">今日</span> ipset counters 精确计包</div>
+            <div class="kpi-foot"><span class="tag tag--green">今日</span> 内核逐包计数</div>
           </div>
           <div class="kpi">
             <div class="kpi-label">超阈值事件</div>
             <div class="kpi-row"><div class="kpi-num" id="kpiEvents">0</div><svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><polyline points="0,25 12,23 24,26 36,18 48,20 60,14 72,17 84,9 100,12" fill="none" stroke="#82A3BE" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg></div>
-            <div class="kpi-foot"><span class="tag tag--blue">近 24h</span> 滑动窗口判定</div>
+            <div class="kpi-foot"><span class="tag tag--blue">近 24h</span> hashlimit 判定</div>
           </div>
           <div class="kpi">
             <div class="kpi-label">生效黑名单</div>
@@ -1879,7 +1879,7 @@ select.input{background-color:rgba(3,12,24,.72)}
             <div class="globe-head">
               <div class="eyebrow">Global telemetry / 全球态势</div>
               <h3>地球动态仪 <span class="tag tag--blue">LIVE</span></h3>
-              <p>触碰源按方位投影至球面，光点脉冲映射命中强度；轨道环与相位条对应控制面轮询周期。计包数据取自 ipset hfish_guard_seen，不依赖蜜罐内部 API 或数据库结构。</p>
+              <p>触碰源按方位投影至球面，光点脉冲映射命中强度；轨道环与相位条对应控制面轮询周期。计包数据取自各端口规则的包计数器，判定由内核 hashlimit 完成，不依赖蜜罐内部 API 或数据库结构。</p>
             </div>
             <div class="globe-metrics">
               <div class="gm"><span class="gm-label">活跃源节点</span><span class="gm-val" id="globeNodes">0</span><span class="gm-unit">IP</span></div>
@@ -1934,7 +1934,7 @@ select.input{background-color:rgba(3,12,24,.72)}
             <div class="panel">
               <div class="panel-head"><div class="panel-title">三层链路健康</div><div class="panel-note"><span class="lamp" aria-hidden="true"></span> 全部正常</div></div>
               <div class="panel-body">
-                <div class="chain-row"><span class="lamp" style="margin-top:5px" aria-hidden="true"></span><div><div class="chain-name">数据面 · 内核</div><div class="chain-desc">iptables 陷阱 → ipset hfish_guard_seen（counters）</div></div><div class="chain-val">ACTIVE</div></div>
+                <div class="chain-row"><span class="lamp" style="margin-top:5px" aria-hidden="true"></span><div><div class="chain-name">数据面 · 内核</div><div class="chain-desc">iptables 陷阱 → hashlimit 判定 → ipset 命中池</div></div><div class="chain-val">ACTIVE</div></div>
                 <div class="chain-row"><span class="lamp" style="margin-top:5px" aria-hidden="true"></span><div><div class="chain-name">控制面 · guard.py</div><div class="chain-desc">systemd 托管 · 每 <span id="chainPoll">10</span>s 轮询 · 配置热加载</div></div><div class="chain-val mono" id="lastPoll">3s 前</div></div>
                 <div class="chain-row"><span class="lamp" style="margin-top:5px" aria-hidden="true"></span><div><div class="chain-name">接口面 · :9705</div><div class="chain-desc">REST API + 单页控制台 · Token 鉴权</div></div><div class="chain-val">200 OK</div></div>
               </div>
@@ -1961,10 +1961,10 @@ select.input{background-color:rgba(3,12,24,.72)}
       <!-- ---------- 事件流 ---------- -->
       <section class="view" data-view="events" hidden>
         <div class="view-head">
-          <div><div class="eyebrow">Events / 判定记录</div><h2 class="view-title" tabindex="-1">事件流</h2><p class="view-sub">来自 seen 集合的滑动窗口判定结果，观察模式下不产生封禁动作。</p></div>
+          <div><div class="eyebrow">Events / 判定记录</div><h2 class="view-title" tabindex="-1">事件流</h2><p class="view-sub">来自内核 hashlimit 判定的结果，观察模式下命中只记录、不下发封禁。</p></div>
           <div class="view-actions"><button class="btn" type="button" data-action="export"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>导出 CSV</button></div>
         </div>
-        <div class="note" style="margin-bottom:16px"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span>事件由控制面每 <b class="mono">10s</b> 轮询 ipset counters 生成；白名单命中在内核侧直接豁免，不写入日志、不形成事件洪水。点击任意行查看处置详情。</span></div>
+        <div class="note" style="margin-bottom:16px"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span>判定在内核完成：每端口一条 <b class="mono">hashlimit</b> 规则按源 IP 计速率，超过「阈值 / 窗口」即命中；控制面每 <b class="mono">10s</b> 取走命中池生成事件。白名单在内核侧直接豁免，不计包、不产生事件。点击任意行查看处置详情。</span></div>
         <div class="panel">
           <div class="toolbar">
             <div class="segmented" role="group" aria-label="事件筛选">
@@ -1990,7 +1990,7 @@ select.input{background-color:rgba(3,12,24,.72)}
       <!-- ---------- 黑名单 ---------- -->
       <section class="view" data-view="blacklist" hidden>
         <div class="view-head">
-          <div><div class="eyebrow">Deny list / 封禁</div><h2 class="view-title" tabindex="-1">黑名单</h2><p class="view-sub">超阈值源 IP 写入黑名单 ipset，全端口 DROP；TTL 到期自动解除。</p></div>
+          <div><div class="eyebrow">Deny list / 封禁</div><h2 class="view-title" tabindex="-1">黑名单</h2><p class="view-sub">内核判定超阈值的源 IP 写入黑名单 ipset，全端口 DROP；TTL 到期自动解除。</p></div>
           <div class="view-actions"><span class="tag tag--red"><span class="lamp lamp--red" aria-hidden="true"></span><span id="blCountLabel">0 条生效</span></span></div>
         </div>
         <div class="panel">
@@ -2003,14 +2003,14 @@ select.input{background-color:rgba(3,12,24,.72)}
           </form>
         </div>
         <div class="panel mt-16">
-          <div class="panel-head"><div class="panel-title">生效中的封禁条目</div><div class="panel-note mono">ipset hfish_guard_blacklist</div></div>
+          <div class="panel-head"><div class="panel-title">生效中的封禁条目</div><div class="panel-note mono">ipset hfish_guard_black</div></div>
           <div class="table-scroll">
             <table class="data-table">
               <thead><tr><th>源 IP / 网段</th><th>归属地</th><th>触发端口</th><th class="num">命中包数</th><th>封禁时间</th><th>剩余 TTL</th><th>备注</th><th></th></tr></thead>
               <tbody id="blRows"></tbody>
             </table>
           </div>
-          <div class="table-foot"><span>TTL 到期后由 ipset 自动移除，无需人工干预</span></div>
+          <div class="table-foot"><span>TTL 到期后由守护进程解封（ipset + 数据库同时移除），无需人工干预</span></div>
         </div>
       </section>
 
@@ -2050,7 +2050,7 @@ select.input{background-color:rgba(3,12,24,.72)}
             <div class="section-label">判定策略</div>
             <div class="form-grid form-grid--3">
               <div class="field"><label class="field-label" for="cfgThreshold">触发阈值（包）<span class="req">*</span></label><input class="input mono" id="cfgThreshold" type="number" min="1" max="100000" required><div class="hint">默认 40 包</div><div class="err" id="cfgThresholdErr" role="alert"></div></div>
-              <div class="field"><label class="field-label" for="cfgWindow">滑动窗口（秒）<span class="req">*</span></label><input class="input mono" id="cfgWindow" type="number" min="10" max="3600" required><div class="hint">默认 60s</div><div class="err" id="cfgWindowErr" role="alert"></div></div>
+              <div class="field"><label class="field-label" for="cfgWindow">判定窗口（秒）<span class="req">*</span></label><input class="input mono" id="cfgWindow" type="number" min="10" max="3600" required><div class="hint">默认 60s</div><div class="err" id="cfgWindowErr" role="alert"></div></div>
               <div class="field"><label class="field-label" for="cfgPoll">轮询周期（秒）<span class="req">*</span></label><input class="input mono" id="cfgPoll" type="number" min="1" max="300" required><div class="hint">默认 10s</div><div class="err" id="cfgPollErr" role="alert"></div></div>
             </div>
           </div>
@@ -2244,7 +2244,7 @@ for(var j=0;j<32;j++){
   state.events.push({id:'EV-'+(2100+j),ts:T0-j*1000*(40+Math.floor(rnd()*180)),ip:src,port:port,packets:pk,verdict:vd});
 }
 function sumPackets(){
-  /* 连后端时「窗口内包数」以守护进程的滑动窗口为准，而不是本地图表点之和 */
+  /* 连后端时「窗口内包数」以守护进程上报的实时增量为准，而不是本地图表点之和 */
   if(window.HG_LIVE&&HG_LIVE.live&&typeof state.windowSum==='number')return state.windowSum;
   return state.packets.reduce(function(a,b){return a+b;},0);
 }
@@ -2819,8 +2819,8 @@ function openDrawer(e){
     '<div class="kv"><dt>执行动作</dt><dd style="color:var(--'+(a.cls==='red'?'red':a.cls==='amber'?'amber':a.cls==='green'?'green':'t3')+')">'+a.label+'</dd></div>'+
     '</dl>'+
     '<div class="timeline"><div><span>'+fmtTime(e.ts-2000)+'</span>数据包命中蜜罐端口陷阱</div>'+
-    '<div><span>'+fmtTime(e.ts-1000)+'</span>源 IP 计入 ipset hfish_guard_seen（counters）</div>'+
-    '<div><span>'+fmtTime(e.ts)+'</span>控制面滑动窗口判定：'+(e.verdict==='over'?'超阈值':e.verdict==='exempt'?'白名单豁免':'未达阈值')+'</div>'+
+    '<div><span>'+fmtTime(e.ts-1000)+'</span>源 IP 计入 hfish_guard_seen，内核按速率判定</div>'+
+    '<div><span>'+fmtTime(e.ts)+'</span>内核 hashlimit 判定：'+(e.verdict==='over'?'超阈值':e.verdict==='exempt'?'白名单豁免':'未达阈值')+'</div>'+
     '<div><span>'+fmtTime(e.ts+500)+'</span>'+a.label+'，事件写入接口面</div></div>'+
     '<div class="note" style="margin-top:6px"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span>加入黑名单将对该源 IP 全端口 DROP；加入白名单后内核侧直接豁免，不再产生日志。</span></div>';
   $('#drawerBackdrop').hidden=false;$('#drawer').hidden=false;

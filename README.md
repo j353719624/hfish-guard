@@ -7,14 +7,16 @@
 ## 整体架构
 
 ```
-数据面（内核 iptables/ipset）
-  陷阱规则：目的端口 ∈ 蜜罐端口列表 的包 → 源 IP 记入 ipset hfish_guard_seen_<端口>
-  （hash:ip counters，300s 兜底超时；白名单在内核侧 ! --match-set 豁免；零日志洪水）
+数据面（内核 netfilter，每蜜罐端口两条规则 + 一条全局 DROP）
+  记名：目的端口 ∈ 蜜罐端口的包 → 源 IP 进 ipset hfish_guard_seen_<端口>
+        （白名单在内核侧 ! --match-set 豁免，不计包、不产生事件）
+  判定：-m hashlimit 按源 IP 计速率，超过「阈值 / 窗口」即写命中池
+        封禁模式 enforce → hfish_guard_black（顶部 DROP 规则全端口断网）
+        观察模式 observe → hfish_guard_alert（只记名，用户态取走后清空）
 控制面（guard.py 守护，python3 标准库，systemd 托管）
-  每 poll 秒轮询各 seen 集合的 packets 增量 → 按 (源IP, 端口) 滑窗汇总
-  → 超阈值触发：
-      封禁模式 enforce：源 IP 进 hfish_guard_black + INPUT DROP（全端口断网，TTL 自动解封）
-      观察模式 observe：只记录事件（默认，最安全）
+  每 poll 秒：读各端口规则的包计数器（iptables -vnxL，精确值）→ 流量曲线与端口热度
+             读命中池：black 新增成员 → 落库 + 记「自动封禁」事件 + 管 TTL
+                       alert 成员   → 记「观察记录」事件后清空（允许再次触发）
 接口面（:9705，token 鉴权）
   REST API + 单页 UI：全球态势 / 状态总览 / 事件流水 / 黑名单 / 白名单 / 联动配置
 联动面（可选，消费 HFish 官方出口；不开启则退化为纯内核计数）
@@ -22,6 +24,12 @@
 存储面（/vol2/@appdata/hfish-guard）
   config.json（配置与凭证）+ guard.db（事件流水、黑名单，sqlite3）
 ```
+
+### 为什么判定放在内核（一个真机踩出来的坑）
+
+最初版本靠轮询 ipset 每个成员的 `packets` 计数器做增量，再在用户态累计窗口——真机实测这个方案**根本不会触发**：ipset 的 `packets` 只在条目被创建时记 1，后续同源包不累加，连 `ipset add -exist` 都保持 0。也就是说计数器永远停在 1，阈值永远够不到。
+
+现在改成：内核用 `hashlimit` 直接判定（`--hashlimit-above 阈值/窗口 --hashlimit-burst 阈值`，`--hashlimit-mode srcip`），用户态只负责「取走命中 → 落库 → 管 TTL」。流量曲线仍读每条端口规则自己的包计数器（`iptables -vnxL` 的精确值），所以态势图上的数值是真的。
 
 ## 与蜜罐（fnos-hive）的联动方式
 
@@ -54,8 +62,8 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 
 | 模块 | 说明 |
 |---|---|
-| 检测器 | 每端口一条 iptables 陷阱 + 独立 ipset counters，按 (源 IP, 端口) 精确计数 |
-| 判定器 | 滑动窗口阈值（可配），白名单豁免，同窗口内不重复告警 |
+| 检测器 | 每端口一条 iptables 陷阱（记名 + 规则级包计数）+ 一条 `hashlimit` 判定规则 |
+| 判定器 | 内核 `hashlimit` 按源 IP 计速率，超过「阈值 / 窗口」即命中；白名单内核侧豁免 |
 | 执行器 | ipset 黑名单 + iptables DROP；观察/封禁双模式；规则幂等可重装；重启后自动回填生效封禁 |
 | 过期器 | 黑名单 TTL 自动解封（默认 3600s，0 = 永久） |
 | 日志器 | sqlite 事件流水（时间/IP/端口/包数/判定/动作/详情），自动裁剪至最近 2 万条 |
