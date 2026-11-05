@@ -813,6 +813,17 @@ class SyslogReceiver(threading.Thread):
         self.ingest = ingest
         self.bound = {"udp": False, "tcp": False}
         self.stop_flag = threading.Event()
+        self._socks = []
+
+    def stop(self):
+        """停接收器：置标志并关掉套接字，让阻塞中的 recvfrom/accept 立刻返回。"""
+        self.stop_flag.set()
+        while self._socks:
+            sock = self._socks.pop()
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def run(self):
         threading.Thread(target=self._udp, daemon=True).start()
@@ -826,10 +837,14 @@ class SyslogReceiver(threading.Thread):
         except OSError as e:
             log("syslog UDP 绑定 :%d 失败：%s" % (self.port, e), "warn")
             return
+        self._socks.append(sock)
         self.bound["udp"] = True
+        sock.settimeout(1.0)
         while not self.stop_flag.is_set():
             try:
                 data, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
             except OSError:
                 break
             try:
@@ -846,6 +861,7 @@ class SyslogReceiver(threading.Thread):
         except OSError as e:
             log("syslog TCP 绑定 :%d 失败：%s" % (self.port, e), "warn")
             return
+        self._socks.append(srv)
         self.bound["tcp"] = True
         srv.settimeout(1.0)
         while not self.stop_flag.is_set():
@@ -1385,6 +1401,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             cfg = STORE.apply_patch(body)
             MONITOR.apply_all()
+            hfish_reload()
             STORE.event("system", 0, 0, "config", "配置热加载",
                         "mode=%s threshold=%s window=%s ports=%d" % (
                             cfg["mode"], cfg["threshold"], cfg["window"], len(cfg["ports"])))
@@ -1529,6 +1546,36 @@ def listening_ports():
 def hive_info():
     installed = any(os.path.isdir(d) for d in HIVE_DIRS)
     return {"installed": installed, "dirs": [d for d in HIVE_DIRS if os.path.isdir(d)]}
+
+
+def hfish_reload():
+    """按当前配置启停/重绑 HFish 通路：syslog 端口改了即时重绑，不用重启进程。"""
+    hf = STORE.cfg.get("hfish", {})
+    try:
+        want_port = int(hf.get("syslog_port") or 0)
+    except (TypeError, ValueError):
+        want_port = 0
+    if HFISH.get("ingest") is None:
+        HFISH["ingest"] = Ingest(STORE, MONITOR)
+    cur = HFISH.get("receiver")
+    if hf.get("enabled") and want_port:
+        if cur is None or cur.port != want_port or cur.stop_flag.is_set():
+            if cur is not None:
+                cur.stop()
+            rec = SyslogReceiver(want_port, HFISH["ingest"])
+            rec.start()
+            HFISH["receiver"] = rec
+            log("HFish syslog 接收器监听 :%d（UDP/TCP）" % want_port)
+    elif cur is not None:
+        cur.stop()
+        HFISH["receiver"] = None
+        log("HFish 联动已关闭，syslog 接收器停止")
+    api = HFISH.get("api")
+    if api is None:
+        api = HFISH["api"] = HfishApi(STORE)
+    if hf.get("api_key") and not api.is_alive():
+        api.start()
+        log("HFish 开放 API 情报同步已启动（每 60s 拉一次 /api/v1/attack/ip）")
 
 
 def hfish_link():
@@ -1758,20 +1805,10 @@ def main(argv=None):
         log("攻击模拟器已启动（--fake）", "warn")
 
     # HFish 联动：syslog 接收器（UDP/TCP）+ 开放 API 情报同步，按配置启停
-    HFISH["ingest"] = Ingest(STORE, MONITOR)
     hf_cfg = STORE.cfg.get("hfish", {})
-    if hf_cfg.get("enabled"):
-        receiver = SyslogReceiver(hf_cfg.get("syslog_port", 5514), HFISH["ingest"])
-        receiver.start()
-        HFISH["receiver"] = receiver
-        log("HFish syslog 接收器监听 :%s（UDP/TCP）" % hf_cfg.get("syslog_port"))
-    else:
+    if not hf_cfg.get("enabled"):
         log("HFish 联动未启用（只用内核计数）；需要事件富化请在配置里开启 hfish.enabled")
-    api_client = HfishApi(STORE)
-    HFISH["api"] = api_client
-    if hf_cfg.get("api_key"):
-        api_client.start()
-        log("HFish 开放 API 情报同步已启动（每 60s 拉一次 /api/v1/attack/ip）")
+    hfish_reload()
 
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=prune_loop, daemon=True).start()

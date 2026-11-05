@@ -44,7 +44,7 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 
 配了 `auto_block_level`（`low`/`mid`/`high`/`critical`）后，等级达到且模式为 `enforce` 时**直接封禁**并记 `verdict=hfish` 事件；否则只记录。三个闸门：必须 enforce、必须达等级、同 `(IP, 攻击类型, 蜜罐)` 60 秒内只处理一次（挡告警洪水）。白名单 IP 在入口即丢弃。
 
-联通状态在 `/api/status` 的 `hfish` 字段：`syslog_bound`（`{"udp":true,"tcp":true}`）、`received`（`{"syslog":N,"webhook":N,"skipped":N}`）、`api_ok` / `api_error` / `intel_count`。
+联通状态在 `/api/status` 的 `link.hfish` 字段：`syslog_bound`（`{"udp":true,"tcp":true}`）、`received`（`{"syslog":N,"webhook":N,"skipped":N}`）、`api_ok` / `api_error` / `intel_count`。**改 syslog 端口或开关联动都即时生效**（接收器按配置重绑，不用重启进程）。
 
 > 安全：**4433 绝不要映射到公网**（官方安全声明原话），守卫拉 API 走 `127.0.0.1`；9705 只对 LAN 开放；syslog 端口若被 `rsyslog` 占用（`netstat -lnup | grep 5514`）就换一个，HFish 通知配置里同步改。
 

@@ -127,7 +127,8 @@ UI 里的地球仪落点、攻击弧线、TOP ORIGINS 全部由 `state.events` �
 - **网络边界**：`:9705` 只应对 LAN 开放，不要做端口映射到公网。REST 与页面都靠 token 保护。
 - **凭证**：安装时由 `install_callback` 生成随机 token，同时写进 `config.json`（`chmod 600`）与 `ui/config` 的桌面入口；UI 里可一键轮换，轮换后其他会话需重新登录。
 - **最小权限**：进程以 root 运行（需要 netfilter），但只执行固定的 ipset/iptables 命令，不接受任何来自 HTTP 的 shell 拼接（IP/CIDR 全部正则校验后再用）。
-- **误封风险**：默认 `observe` 模式，先跑几天看事件表，确认阈值不误伤自家设备后再切 `enforce`；白名单务必先加上管理设备与网关。
+- **新增入站面要收口**：syslog 端口与 `/api/hfish/webhook` 是外部可写入口。syslog 只依赖「仅 LAN 可达」这条边界（同机部署即只监听本机网段），webhook 必须带 `k=` 校验串、且 `hfish.enabled=false` 时返回 403；两者进来的一切内容都只当**事件数据**，绝不当命令。
+- **误封风险**：默认 `observe` 模式，先跑几天看事件表，确认阈值不误伤自家设备后再切 `enforce`；白名单务必先加上管理设备与网关。按等级自动封禁同理——先不配 `auto_block_level`，看清 HFish 的等级分布再配。
 
 ---
 
@@ -163,7 +164,7 @@ HFish 面板操作：
 2. **告警配置 → 告警策略 → 新增**：类型选「威胁告警」，通知方式勾上刚才那条 syslog；
 3. 攻击发生即外发，最长 1 分钟内到达。
 
-guard 侧：UI「配置 → HFish 联动」里勾「接入 HFish 告警」，syslog 端口填 `5514`。端口绑定状态在 `/api/status` 的 `hfish.syslog_bound` 里可见（`{"udp":true,"tcp":true}`）。
+guard 侧：UI「配置 → HFish 联动」里勾「接入 HFish 告警」，syslog 端口填 `5514`。端口绑定状态在 `/api/status` 的 `link.hfish.syslog_bound` 里可见（`{"udp":true,"tcp":true}`）。**改端口或开关联动即时生效**：`hfish_reload()` 会停掉旧接收器、按新端口重绑，不需要重启进程（`test_07/08` 覆盖）。
 
 官方 syslog 威胁告警字段（guard 全部解析，缺字段不影响）：
 

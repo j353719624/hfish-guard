@@ -2080,21 +2080,24 @@ select.input{background-color:rgba(3,12,24,.72)}
               <div class="form-grid form-grid--3">
                 <div class="field"><label class="field-label" for="cfgHfishEnabled">事件接入</label>
                   <select class="input" id="cfgHfishEnabled"><option value="0">关闭</option><option value="1">开启（接收 syslog / webhook）</option></select>
-                  <div class="hint">开启后监听下方 syslog 端口，端口变更需重启守护</div></div>
+                  <div class="hint">开启后监听下方 syslog 端口并接收 webhook，改动即时生效</div></div>
                 <div class="field"><label class="field-label" for="cfgHfishSyslog">syslog 端口</label>
                   <input class="input mono" id="cfgHfishSyslog" type="number" min="1" max="65535">
                   <div class="hint">HFish「告警策略 → syslog」指向本机该端口（UDP/TCP）</div></div>
                 <div class="field"><label class="field-label" for="cfgHfishLevel">按告警等级自动封禁</label>
-                  <select class="input" id="cfgHfishLevel"><option value="">不自动封禁</option><option value="high">high 及以上</option><option value="critical">critical</option></select>
+                  <select class="input" id="cfgHfishLevel"><option value="">不自动封禁</option><option value="low">low 及以上</option><option value="mid">mid 及以上</option><option value="high">high 及以上</option><option value="critical">critical</option></select>
                   <div class="hint">仅封禁模式生效，沿用上方黑名单 TTL</div></div>
               </div>
-              <div class="form-grid mt-16" style="padding:0">
+              <div class="form-grid form-grid--3 mt-16">
                 <div class="field"><label class="field-label" for="cfgHfishApi">开放 API 地址</label>
                   <input class="input mono" id="cfgHfishApi" placeholder="https://127.0.0.1:4433" autocomplete="off">
                   <div class="hint">HFish 管理端地址；留空则只收 syslog/webhook</div></div>
                 <div class="field"><label class="field-label" for="cfgHfishKey">API Key</label>
                   <input class="input mono" id="cfgHfishKey" type="password" autocomplete="off" placeholder="HFish 系统设置 → API 配置">
                   <div class="hint">只做情报补充（攻击来源/标签），不参与阈值判定</div></div>
+                <div class="field"><label class="field-label" for="cfgHfishWtok">webhook 校验串</label>
+                  <input class="input mono" id="cfgHfishWtok" autocomplete="off" placeholder="留空则用上方主凭证">
+                  <div class="hint">HFish「webhook → 自定义」URL 末尾的 <code>?k=</code></div></div>
               </div>
               <div class="hint" id="cfgHfishHint" style="margin-top:10px">—</div>
             </div>
@@ -2430,6 +2433,7 @@ function fillConfig(){
   if($('#cfgHfishLevel'))$('#cfgHfishLevel').value=hf.auto_block_level||'';
   if($('#cfgHfishApi'))$('#cfgHfishApi').value=hf.api_base||'';
   if($('#cfgHfishKey'))$('#cfgHfishKey').value=hf.api_key||'';
+  if($('#cfgHfishWtok'))$('#cfgHfishWtok').value=hf.webhook_token||'';
   renderHfishHint();
   ['cfgThresholdErr','cfgWindowErr','cfgPollErr','cfgTtlErr','portErr'].forEach(function(id){$('#'+id).textContent='';});
   state.cfgDirty=false;
@@ -3080,7 +3084,8 @@ $('#cfgForm').addEventListener('submit',function(e){
     syslog_port:Number($('#cfgHfishSyslog').value)||5514,
     auto_block_level:$('#cfgHfishLevel').value,
     api_base:$('#cfgHfishApi').value.trim(),
-    api_key:$('#cfgHfishKey').value.trim()
+    api_key:$('#cfgHfishKey').value.trim(),
+    webhook_token:$('#cfgHfishWtok').value.trim()
   };
   state.hfish=hfNew;
   $$('[data-mode]').forEach(function(x){var on=x.dataset.mode===state.mode;x.classList.toggle('is-on',on);x.setAttribute('aria-pressed',String(on));});

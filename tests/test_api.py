@@ -373,6 +373,44 @@ class HfishIngestTest(ApiBase):
         rows = self.call("GET", "/api/events?limit=100")
         self.assertIn("192.0.2.55", [r["ip"] for r in rows])
 
+    def test_07_syslog_rebinds_on_config_change(self):
+        # UI 里改 syslog 端口必须即时生效：不重启进程也要重绑到新端口
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        new_port = s.getsockname()[1]
+        s.close()
+        cfg = self.call("PUT", "/api/config", {"hfish": {"syslog_port": new_port}})
+        self.assertEqual(cfg["config"]["hfish"]["syslog_port"], new_port)
+
+        bound = {}
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            hf = self.call("GET", "/api/status")["link"]["hfish"]
+            bound = hf["syslog_bound"]
+            if hf["syslog_port"] == new_port and bound.get("udp") and bound.get("tcp"):
+                break
+            time.sleep(0.3)
+        self.assertTrue(bound.get("udp"), "新端口未绑定 UDP")
+        self.assertTrue(bound.get("tcp"), "新端口未绑定 TCP")
+
+        type(self).syslog_port = new_port      # 后续 syslog() 打到新端口
+        self.syslog({"src_ip": "192.0.2.77", "attack_type": "scan", "class": "Redis",
+                     "threat_level": "low"})
+        rows = self.call("GET", "/api/events?limit=100")
+        self.assertIn("192.0.2.77", [r["ip"] for r in rows], "重绑后新端口收不到告警")
+
+    def test_08_disable_stops_receiver(self):
+        self.call("PUT", "/api/config", {"hfish": {"enabled": False}})
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            hf = self.call("GET", "/api/status")["link"]["hfish"]
+            if not hf["enabled"] and not hf["syslog_bound"].get("udp"):
+                break
+            time.sleep(0.3)
+        hf = self.call("GET", "/api/status")["link"]["hfish"]
+        self.assertFalse(hf["enabled"])
+        self.assertFalse(hf["syslog_bound"].get("udp"), "关闭联动后应释放 syslog 端口")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
