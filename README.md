@@ -7,12 +7,13 @@
 ## 整体架构
 
 ```
-数据面（内核 netfilter，每蜜罐端口两条规则 + 一条全局 DROP）
-  记名：目的端口 ∈ 蜜罐端口的包 → 源 IP 进 ipset hfish_guard_seen_<端口>
+数据面（内核 netfilter，双栈 IPv4 + IPv6，TCP + UDP，每端口 10 条规则 + 2 条全局 DROP）
+  记名：目的端口 ∈ 蜜罐端口的包 → 源 IP 进 ipset hfish_guard_seen_<端口>（IPv6 走 seen_6_<端口>）
         （白名单在内核侧 ! --match-set 豁免，不计包、不产生事件）
   判定：-m hashlimit 按源 IP 计速率，超过「阈值 / 窗口」即写命中池
-        封禁模式 enforce → hfish_guard_black（顶部 DROP 规则全端口断网）
-        观察模式 observe → hfish_guard_alert（只记名，用户态取走后清空）
+        封禁模式 enforce → hfish_guard_black / black6（顶部 DROP 规则全端口断网）
+        观察模式 observe → hfish_guard_alert / alert6（只记名，用户态取走后清空）
+  扫描面：用户态每轮读 seen 集合，同一源命中 ≥ scan_ports 个不同蜜罐端口即判端口扫描
 控制面（guard.py 守护，python3 标准库，systemd 托管）
   每 poll 秒：读各端口规则的包计数器（iptables -vnxL，精确值）→ 流量曲线与端口热度
              读命中池：black 新增成员 → 落库 + 记「自动封禁」事件 + 管 TTL
@@ -63,7 +64,8 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 | 模块 | 说明 |
 |---|---|
 | 检测器 | 每端口一条 iptables 陷阱（记名 + 规则级包计数）+ 一条 `hashlimit` 判定规则 |
-| 判定器 | 内核 `hashlimit` 按源 IP 计速率，超过「阈值 / 窗口」即命中；白名单内核侧豁免 |
+| 判定器 | 内核 `hashlimit` 按源 IP 计速率（TCP/UDP × IPv4/IPv6 四套），超过「阈值 / 窗口」即命中；白名单内核侧豁免 |
+| 扫描器 | 同一源在窗口内命中 ≥ `scan_ports` 个不同蜜罐端口 → 判端口扫描（可配是否直接封禁） |
 | 执行器 | ipset 黑名单 + iptables DROP；观察/封禁双模式；规则幂等可重装；重启后自动回填生效封禁 |
 | 过期器 | 黑名单 TTL 自动解封（默认 3600s，0 = 永久） |
 | 日志器 | sqlite 事件流水（时间/IP/端口/包数/判定/动作/详情），自动裁剪至最近 2 万条 |
@@ -87,6 +89,9 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 | poll | 10 | 轮询间隔秒数 |
 | ttl | 3600 | 黑名单过期秒数，0=永久 |
 | ports | 蜜罐端口列表 | 监视的蜜罐端口（与 hive 服务保持一致） |
+| udp | true | 是否同时 trap UDP（蜜罐端口上的 UDP 探测） |
+| scan_ports | 6 | 同源命中多少个不同蜜罐端口算扫描，0=关闭 |
+| scan_block | true | 判定为扫描时是否直接封禁（仅 enforce 生效） |
 | whitelist | 空 | 永不计数、永不封禁的 IP / CIDR（内核侧豁免） |
 | hfish.enabled | false | 是否接收 HFish 告警（syslog / webhook） |
 | hfish.syslog_port | 5514 | syslog 监听端口，UDP + TCP 同时绑定 |

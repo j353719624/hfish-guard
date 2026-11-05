@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -59,6 +59,7 @@ SIMULATE = os.environ.get("HFISH_GUARD_SIM", "1").strip().lower() not in ("0", "
 
 IPS = os.environ.get("HFISH_GUARD_IPSET", "/usr/sbin/ipset")
 IPT = os.environ.get("HFISH_GUARD_IPTABLES", "/usr/sbin/iptables")
+IP6T = os.environ.get("HFISH_GUARD_IP6TABLES", "/usr/sbin/ip6tables")
 
 # fnOS 把应用解到 /vol2/@appcenter/<app>/bin，同时在 /var/apps/<app>/ 下挂符号链接
 UI_CANDIDATES = (
@@ -74,6 +75,9 @@ SEEN_PREFIX = "hfish_guard_seen_"
 SET_WHITE = "hfish_guard_white"
 SET_BLACK = "hfish_guard_black"
 SET_ALERT = "hfish_guard_alert"     # 观察模式下内核判定的命中池
+SET_WHITE6 = "hfish_guard_white6"   # IPv6 对应集合（ipset family inet6）
+SET_BLACK6 = "hfish_guard_black6"
+SET_ALERT6 = "hfish_guard_alert6"
 SEEN_TIMEOUT = 300                      # seen 集合成员兜底过期时间（秒）
 ALERT_TIMEOUT = 900                     # 观察命中池保留时长（供用户态取走事件）
 
@@ -93,6 +97,9 @@ DEFAULT_CONFIG = {
     "whitelist": [],
     "token": "",                        # 空 = 首次启动自动生成
     # HFish 联动（官方三种出口：开放 API / syslog / webhook），可全部留空只用内核计数
+    "udp": True,                        # 同时 trap UDP（蜜罐端口上的 UDP 扫描）
+    "scan_ports": 6,                    # 同源在窗口内命中多少个不同蜜罐端口算端口扫描
+    "scan_block": True,                 # 判定为端口扫描时是否直接封禁（仅 enforce 生效）
     "hfish": {
         "enabled": False,               # 总开关：开启后才监听 syslog / 接受 webhook
         "syslog_port": 5514,            # HFish「告警策略 → syslog」指向本机此端口（UDP+TCP）
@@ -167,8 +174,27 @@ def ip_int(s):
     return n
 
 
-def set_name(port):
-    return "%s%s" % (SEEN_PREFIX, port)
+def _truthy(val, default=False):
+    """把用户传的 true/"1"/"on" 之类统一成布尔。"""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return str(val).strip().lower() in ("1", "true", "yes", "on", "enable", "enabled")
+
+
+def _is_v6(addr):
+    """判断地址/网段是否 IPv6（用于选集合与 iptables 分支）。"""
+    try:
+        return ipaddress.ip_network(str(addr).strip(), strict=False).version == 6
+    except ValueError:
+        return ":" in str(addr)
+
+
+def set_name(port, v6=False):
+    return "%s%s%s" % (SEEN_PREFIX, "6_" if v6 else "", port)
 
 
 def rate_spec(threshold, window):
@@ -216,12 +242,15 @@ class Whitelist:
 
 # --------------------------------------------------------------------- 内核层
 class RealKernel:
-    """ipset + iptables 真实实现。
+    """ipset + iptables / ip6tables 真实实现（IPv4 + IPv6 双栈）。
 
-    判定放在内核里：每个蜜罐端口两条规则
-      1) 记名：命中的源 IP 进 seen_<port>（白名单在内核侧豁免），用于事件归属端口
-      2) 判定：-m hashlimit 按源 IP 计速率，超过 threshold/window 就写命中池
-              （enforce 直接写 black，observe 写 alert 供用户态记录）
+    每个蜜罐端口挂两类规则：
+      1) 记名：命中的源 IP 进 seen_<port>（IPv6 用 seen6_<port>），白名单内核侧豁免，
+         这条规则自己的包计数器就是该端口的真实流量；
+      2) 判定：-m hashlimit 按源 IP 计速率，超过 threshold/window 写命中池
+         （enforce→black，observe→alert）。
+    TCP 与 UDP 各挂一套（蜜罐端口上的 UDP 扫描同样要计）。
+
     为什么不用 ipset 的 packets 计数：真机实测该计数器只在条目创建时记 1，
     后续同源包不累加（`ipset add -exist` 也保持 0），拿它做增量永远是 1。
     """
@@ -230,6 +259,8 @@ class RealKernel:
 
     def __init__(self):
         self.reason = ""
+        self.v6 = False
+        self.v6_reason = ""
         if FAKE:
             self.available = False
             self.reason = "fake mode"
@@ -237,59 +268,100 @@ class RealKernel:
         if not os.path.exists(IPS):
             self.available = False
             self.reason = "未找到 %s（ipset 未安装？）" % IPS
-        elif not is_root():
+            return
+        if not is_root():
             self.available = False
             self.reason = "非 root 运行，无法操作 netfilter"
-        else:
-            rc, out = sh("%s version" % IPS)
-            self.available = rc == 0
-            self.reason = "" if rc == 0 else out.strip()[:120]
+            return
+        rc, out = sh("%s version" % IPS)
+        self.available = rc == 0
+        self.reason = "" if rc == 0 else out.strip()[:120]
+        # IPv6：ip6tables 存在 + 能建 inet6 集合，才算可用
+        if self.available:
+            if not os.path.exists(IP6T):
+                self.v6_reason = "未找到 %s" % IP6T
+            else:
+                rc2, out2 = sh("%s -w 3 -L INPUT -n" % IP6T)
+                if rc2 != 0:
+                    self.v6_reason = (out2 or "ip6tables 不可用").strip()[:120]
+                else:
+                    rc3, _ = sh("%s create hfish_guard_probe6 hash:ip family inet6 -exist" % IPS)
+                    if rc3 != 0:
+                        self.v6_reason = "内核不支持 inet6 集合"
+                    else:
+                        sh("%s destroy hfish_guard_probe6" % IPS)
+                        self.v6 = True
 
     # -- 集合
     def ensure_sets(self, ports):
         for p in ports:
             sh("%s create %s hash:ip timeout %d -exist" % (IPS, set_name(p), SEEN_TIMEOUT))
+            if self.v6:
+                sh("%s create %s hash:ip family inet6 timeout %d -exist"
+                   % (IPS, set_name(p, True), SEEN_TIMEOUT))
         sh("%s create %s hash:ip -exist" % (IPS, SET_WHITE))
         sh("%s create %s hash:ip -exist" % (IPS, SET_BLACK))
         sh("%s create %s hash:ip timeout %d -exist" % (IPS, SET_ALERT, ALERT_TIMEOUT))
+        if self.v6:
+            sh("%s create %s hash:ip family inet6 -exist" % (IPS, SET_WHITE6))
+            sh("%s create %s hash:ip family inet6 -exist" % (IPS, SET_BLACK6))
+            sh("%s create %s hash:ip family inet6 timeout %d -exist"
+               % (IPS, SET_ALERT6, ALERT_TIMEOUT))
 
     def members(self, port):
-        rc, out = sh("%s list %s" % (IPS, set_name(port)))
-        if rc != 0:
-            return {}
-        result, in_members = {}, False
-        for line in out.splitlines():
-            s = line.strip()
-            if s == "Members:":
-                in_members = True
+        out = {}
+        for v6 in ((False, True) if self.v6 else (False,)):
+            rc, txt = sh("%s list %s" % (IPS, set_name(port, v6)))
+            if rc != 0:
                 continue
-            if not in_members or not s:
-                continue
-            parts = s.split()
-            result[parts[0]] = 0
-        return result
+            in_members = False
+            for line in txt.splitlines():
+                t = line.strip()
+                if t == "Members:":
+                    in_members = True
+                    continue
+                if in_members and t:
+                    out[t.split()[0]] = 0
+        return out
 
     def del_member(self, port, ip):
-        sh("%s del %s %s 2>/dev/null" % (IPS, set_name(port), ip))
+        sh("%s del %s %s 2>/dev/null" % (IPS, set_name(port, _is_v6(ip)), ip))
 
     def destroy_set(self, port):
         sh("%s destroy %s 2>/dev/null" % (IPS, set_name(port)))
+        if self.v6:
+            sh("%s destroy %s 2>/dev/null" % (IPS, set_name(port, True)))
 
-    # -- 黑名单 / 命中池
+    # -- 黑名单 / 命中池（按地址族选择集合）
     def add_black(self, ip):
-        return sh("%s add %s %s -exist" % (IPS, SET_BLACK, ip))[0] == 0
+        name = SET_BLACK6 if _is_v6(ip) else SET_BLACK
+        if _is_v6(ip) and not self.v6:
+            return False
+        return sh("%s add %s %s -exist" % (IPS, name, ip))[0] == 0
 
     def del_black(self, ip):
-        sh("%s del %s %s 2>/dev/null" % (IPS, SET_BLACK, ip))
+        name = SET_BLACK6 if _is_v6(ip) else SET_BLACK
+        if _is_v6(ip) and not self.v6:
+            return
+        sh("%s del %s %s 2>/dev/null" % (IPS, name, ip))
 
     def black_members(self):
-        return set(self.members_raw(SET_BLACK))
+        out = set(self.members_raw(SET_BLACK))
+        if self.v6:
+            out |= set(self.members_raw(SET_BLACK6))
+        return out
 
     def alert_members(self):
-        return set(self.members_raw(SET_ALERT))
+        out = set(self.members_raw(SET_ALERT))
+        if self.v6:
+            out |= set(self.members_raw(SET_ALERT6))
+        return out
 
     def del_alert(self, ip):
-        sh("%s del %s %s 2>/dev/null" % (IPS, SET_ALERT, ip))
+        name = SET_ALERT6 if _is_v6(ip) else SET_ALERT
+        if _is_v6(ip) and not self.v6:
+            return
+        sh("%s del %s %s 2>/dev/null" % (IPS, name, ip))
 
     def members_raw(self, name):
         rc, out = sh("%s list %s" % (IPS, name))
@@ -297,81 +369,114 @@ class RealKernel:
             return []
         ips, in_members = [], False
         for line in out.splitlines():
-            s = line.strip()
-            if s == "Members:":
+            t = line.strip()
+            if t == "Members:":
                 in_members = True
                 continue
-            if in_members and s:
-                ips.append(s.split()[0])
+            if in_members and t:
+                ips.append(t.split()[0])
         return ips
 
-    # -- 白名单
+    # -- 白名单（按地址族分流，v6 条目进 inet6 集合）
     def sync_whitelist(self, entries):
         sh("%s flush %s" % (IPS, SET_WHITE))
+        if self.v6:
+            sh("%s flush %s" % (IPS, SET_WHITE6))
         for e in entries:
             cidr = e.get("cidr") if isinstance(e, dict) else e
-            if cidr:
-                sh("%s add %s %s -exist 2>/dev/null" % (IPS, SET_WHITE, cidr))
+            if not cidr:
+                continue
+            v6 = _is_v6(cidr)
+            if v6 and not self.v6:
+                continue
+            sh("%s add %s %s -exist 2>/dev/null"
+               % (IPS, SET_WHITE6 if v6 else SET_WHITE, cidr))
 
-    # -- 规则
-    def seen_rule(self, port):
-        """记名规则：白名单在内核侧豁免，命中白名单的源根本进不了 seen。"""
-        return ("-p tcp --dport %s -m set ! --match-set %s src "
-                "-j SET --add-set %s src" % (port, SET_WHITE, set_name(port)))
+    # -- 规则片段
+    def seen_rule(self, port, v6=False, proto="tcp"):
+        return ("-p %s --dport %s -m set ! --match-set %s src "
+                "-j SET --add-set %s src"
+                % (proto, port, SET_WHITE6 if v6 else SET_WHITE, set_name(port, v6)))
 
-    def hlimit_rule(self, port, threshold, window, target):
-        """判定规则：同一源 IP 在 window 秒内超过 threshold 个包即命中。"""
+    def hlimit_rule(self, port, threshold, window, target, v6=False, proto="tcp"):
         rate = rate_spec(threshold, window)
-        return ("-p tcp --dport %s -m set ! --match-set %s src "
-                "-m hashlimit --hashlimit-name hg%s --hashlimit-mode srcip "
+        return ("-p %s --dport %s -m set ! --match-set %s src "
+                "-m hashlimit --hashlimit-name hg%s%s%s --hashlimit-mode srcip "
                 "--hashlimit-above %s --hashlimit-burst %d "
                 "--hashlimit-htable-expire %d --hashlimit-htable-size 2048 "
-                "-j SET --add-set %s src" % (port, SET_WHITE, port, rate,
-                                             threshold, window * 2000, target))
+                "-j SET --add-set %s src"
+                % (proto, port, SET_WHITE6 if v6 else SET_WHITE,
+                   "6" if v6 else "", "" if proto == "tcp" else "u", port,
+                   rate, threshold, window * 2000, target))
 
-    def hlimit_drop(self, port, threshold, window):
+    def hlimit_drop(self, port, threshold, window, v6=False, proto="tcp"):
         rate = rate_spec(threshold, window)
-        return ("-p tcp --dport %s -m set ! --match-set %s src "
-                "-m hashlimit --hashlimit-name hg%s --hashlimit-mode srcip "
+        return ("-p %s --dport %s -m set ! --match-set %s src "
+                "-m hashlimit --hashlimit-name hg%s%s%s --hashlimit-mode srcip "
                 "--hashlimit-above %s --hashlimit-burst %d "
                 "--hashlimit-htable-expire %d --hashlimit-htable-size 2048 -j DROP"
-                % (port, SET_WHITE, port, rate, threshold, window * 2000))
+                % (proto, port, SET_WHITE6 if v6 else SET_WHITE,
+                   "6" if v6 else "", "" if proto == "tcp" else "u", port,
+                   rate, threshold, window * 2000))
 
-    def drop_rule(self):
-        return "-m set --match-set %s src -j DROP" % SET_BLACK
+    def drop_rule(self, v6=False):
+        return "-m set --match-set %s src -j DROP" % (SET_BLACK6 if v6 else SET_BLACK)
 
     def flush_ours(self):
-        """删掉本应用在 INPUT 上的全部规则（含旧版本留下的），保证重下发幂等。"""
-        rc, out = sh("%s -S INPUT" % IPT)
-        if rc != 0:
-            return
-        for line in out.splitlines():
-            if not line.startswith("-A "):
+        """删掉本应用在 INPUT 上的全部规则（含旧版本、含 v6），保证重下发幂等。"""
+        for cmd in ([IPT] + ([IP6T] if self.v6 else [])):
+            rc, out = sh("%s -S INPUT" % cmd)
+            if rc != 0:
                 continue
-            if "hfish_guard_" not in line and "hashlimit-name hg" not in line:
-                continue
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                continue
-            parts[0] = "-D"
-            sh("%s %s 2>/dev/null" % (IPT, " ".join(parts)))
+            for line in out.splitlines():
+                if not line.startswith("-A "):
+                    continue
+                if "hfish_guard_" not in line and "hashlimit-name hg" not in line:
+                    continue
+                try:
+                    parts = shlex.split(line)
+                except ValueError:
+                    continue
+                parts[0] = "-D"
+                sh("%s %s 2>/dev/null" % (cmd, " ".join(parts)))
 
-    def apply_traps(self, ports, prev_ports=(), threshold=40, window=60, mode="observe"):
+    def apply_traps(self, ports, prev_ports=(), threshold=40, window=60,
+                    mode="observe", udp=True):
         self.ensure_sets(ports)
         for p in prev_ports:
             if p not in ports:
                 self.destroy_set(p)
         self.flush_ours()
         target = SET_BLACK if mode == "enforce" else SET_ALERT
+        target6 = SET_BLACK6 if mode == "enforce" else SET_ALERT6
         for p in ports:
-            for spec in [self.seen_rule(p), self.hlimit_rule(p, threshold, window, target)] + \
-                        ([self.hlimit_drop(p, threshold, window)] if mode == "enforce" else []):
-                rc, out = sh("%s -I INPUT %s" % (IPT, spec))
-                if rc != 0:                       # 规则没挂上就等于没防护，必须可见
-                    log("下发规则失败（端口 %s）：%s" % (p, (out or "").strip()[:160]), "error")
+            specs = [(IPT, self.seen_rule(p), "tcp4"),
+                     (IPT, self.hlimit_rule(p, threshold, window, target), "tcp4")]
+            if mode == "enforce":
+                specs.append((IPT, self.hlimit_drop(p, threshold, window), "tcp4"))
+            if udp:
+                specs.append((IPT, self.seen_rule(p, False, "udp"), "udp4"))
+                specs.append((IPT, self.hlimit_rule(p, threshold, window, target,
+                                                    False, "udp"), "udp4"))
+            if self.v6:
+                specs.append((IP6T, self.seen_rule(p, True), "tcp6"))
+                specs.append((IP6T, self.hlimit_rule(p, threshold, window, target6,
+                                                     True), "tcp6"))
+                if mode == "enforce":
+                    specs.append((IP6T, self.hlimit_drop(p, threshold, window, True), "tcp6"))
+                if udp:
+                    specs.append((IP6T, self.seen_rule(p, True, "udp"), "udp6"))
+                    specs.append((IP6T, self.hlimit_rule(p, threshold, window, target6,
+                                                         True, "udp"), "udp6"))
+            for cmd, spec, tag in specs:
+                rc, out = sh("%s -I INPUT %s" % (cmd, spec))
+                if rc != 0:                   # 规则没挂上就等于没防护，必须可见
+                    log("下发 %s 规则失败（端口 %s）：%s"
+                        % (tag, p, (out or "").strip()[:160]), "error")
         # 黑名单 DROP 永远压在最前面
         sh("%s -I INPUT 1 %s" % (IPT, self.drop_rule()))
+        if self.v6:
+            sh("%s -I INPUT 1 %s" % (IP6T, self.drop_rule(True)))
 
     def trap_present(self, ports):
         if not ports:
@@ -379,26 +484,44 @@ class RealKernel:
         rc, out = sh("%s -S INPUT" % IPT)
         if rc != 0:
             return False
-        return all(("hfish_guard_seen_%s " % p) in out for p in ports)
+        if not all(("hfish_guard_seen_%s " % p) in out for p in ports):
+            return False
+        if self.v6:
+            rc6, out6 = sh("%s -S INPUT" % IP6T)
+            if rc6 == 0 and not all(("%s " % set_name(p, True)) in out6 for p in ports):
+                return False
+        return True
 
-    # -- 读计数：每条端口规则自己的包计数器（-x 精确值）
+    # -- 读计数：每条端口规则自己的包计数器（-x 精确值），v4+v6 求和
     def port_counters(self, ports):
-        rc, out = sh("%s -vnxL INPUT" % IPT)
-        if rc != 0:
-            return {}
         result = {}
-        for line in out.splitlines():
-            m = re.search(r"--add-set (hfish_guard_seen_\d+) src", line) or \
-                re.search(r"add-set (hfish_guard_seen_\d+) src", line)
-            if not m:
+        for cmd in ([IPT] + ([IP6T] if self.v6 else [])):
+            rc, out = sh("%s -vnxL INPUT" % cmd)
+            if rc != 0:
                 continue
-            port = m.group(1).rsplit("_", 1)[-1]
-            parts = line.split()
-            try:
-                result[port] = result.get(port, 0) + int(parts[0])
-            except (IndexError, ValueError):
-                continue
+            for line in out.splitlines():
+                m = re.search(r"add-set (hfish_guard_seen(?:_6)?_\d+) src", line)
+                if not m:
+                    continue
+                port = m.group(1).rsplit("_", 1)[-1]
+                parts = line.split()
+                try:
+                    result[port] = result.get(port, 0) + int(parts[0])
+                except (IndexError, ValueError):
+                    continue
         return result
+
+    def stats(self):
+        """给 /api/status 用的规则统计。"""
+        out = {"v6": self.v6, "v6_reason": self.v6_reason, "rules": {}}
+        for name, cmd in (("v4", IPT), ("v6", IP6T)):
+            if name == "v6" and not self.v6:
+                continue
+            rc, txt = sh("%s -S INPUT" % cmd)
+            if rc == 0:
+                out["rules"][name] = sum(1 for line in txt.splitlines()
+                                         if "hfish_guard_" in line)
+        return out
 
 
 class FakeKernel:
@@ -411,6 +534,8 @@ class FakeKernel:
     kind = "fake"
     available = True
     reason = ""
+    v6 = False                  # 内存模拟不区分地址族
+    v6_reason = "fake 内核不模拟 IPv6"
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -488,8 +613,10 @@ class FakeKernel:
             self.white = set(e.get("cidr") if isinstance(e, dict) else e for e in entries)
             self.white_net = Whitelist(entries)
 
-    def apply_traps(self, ports, prev_ports=(), threshold=40, window=60, mode="observe"):
+    def apply_traps(self, ports, prev_ports=(), threshold=40, window=60,
+                    mode="observe", udp=True):
         with self._lock:
+            self.udp = bool(udp)
             self.threshold = max(1, int(threshold))
             self.window = max(5, int(window))
             self.mode = mode if mode in ("observe", "enforce") else "observe"
@@ -509,6 +636,10 @@ class FakeKernel:
     def port_counters(self, ports):
         with self._lock:
             return {str(p): int(self.traffic.get(str(p), 0)) for p in ports}
+
+    def stats(self):
+        return {"v6": False, "v6_reason": self.v6_reason,
+                "rules": {"v4": len(self.traps) * 2}}
 
 
 # --------------------------------------------------------------------- 存储层
@@ -611,6 +742,12 @@ class Store:
                                       cfg.get("mode"))
         if cfg["mode"] not in ("observe", "enforce"):
             cfg["mode"] = "observe"
+        cfg["udp"] = _truthy(cfg.get("udp"), True)
+        cfg["scan_block"] = _truthy(cfg.get("scan_block"), True)
+        try:
+            cfg["scan_ports"] = max(0, min(64, int(cfg.get("scan_ports"))))
+        except (TypeError, ValueError):
+            cfg["scan_ports"] = DEFAULT_CONFIG["scan_ports"]
         return cfg
 
     def save_cfg(self):
@@ -635,6 +772,17 @@ class Store:
                     continue
                 if lo <= val <= hi:
                     cfg[key] = val
+        if "udp" in body:
+            cfg["udp"] = _truthy(body.get("udp"), cfg.get("udp", True))
+        if "scan_block" in body:
+            cfg["scan_block"] = _truthy(body.get("scan_block"), cfg.get("scan_block", True))
+        if "scan_ports" in body:
+            try:
+                val = int(body["scan_ports"])
+                if 0 <= val <= 64:
+                    cfg["scan_ports"] = val
+            except (TypeError, ValueError):
+                pass
         want = LEGACY_MODE.get(str(body.get("mode") or "").strip().lower(),
                                body.get("mode"))
         if want in ("observe", "enforce"):
@@ -1185,6 +1333,7 @@ class Monitor:
         self.poll_interval = int(store.cfg.get("poll", POLL_DEFAULT))
         self.last_error = ""
         self.alert_last = {}        # ip -> 上次记录观察事件的时间（去抖）
+        self.scan_last = {}         # ip -> 上次记「端口扫描」事件的时间（去抖）
         self.recent_hits = []       # [(ts, ip)] 最近命中（供 top_src 用）
         self.whitelist = Whitelist(store.cfg.get("whitelist"))
         self.stats = {"polls": 0, "blocked": 0, "events": 0}
@@ -1198,7 +1347,8 @@ class Monitor:
         self.kernel.sync_whitelist(cfg["whitelist"])
         self.kernel.apply_traps(ports, self.ports_applied,
                                 threshold=int(cfg.get("threshold", 40)),
-                                window=self.window, mode=cfg.get("mode", "observe"))
+                                window=self.window, mode=cfg.get("mode", "observe"),
+                                udp=bool(cfg.get("udp", True)))
         self.ports_applied = list(ports)
         # 重启后把仍有效的封禁写回内核（幂等），并作为基线避免重复出事件
         for row in self.store.active_blocks():
@@ -1250,10 +1400,12 @@ class Monitor:
 
         self.collect_blocks(now, threshold)
         self.collect_alerts(now, threshold)
+        self.detect_scans(now)
         self.expire_blocks(now)
         cut = now - self.window
         self.recent_hits = [h for h in self.recent_hits if h[0] >= cut][-200:]
         self.alert_last = {k: v for k, v in self.alert_last.items() if now - v < self.window}
+        self.scan_last = {k: v for k, v in self.scan_last.items() if now - v < self.window}
 
     def port_map(self, ports):
         """IP -> 端口：靠 seen 集合归属，事件里显示「打了哪个端口」。"""
@@ -1316,6 +1468,48 @@ class Monitor:
             self.stats["events"] += 1
             self.recent_hits.append((now, ip))
             log("命中阈值 %s（内核判定，端口 %s）观察模式仅记录" % (ip, port or "-"))
+
+    # -- 端口扫描面：同一源在窗口内命中多少个不同蜜罐端口
+    def detect_scans(self, now):
+        cfg = self.store.cfg
+        need = int(cfg.get("scan_ports", 0) or 0)
+        if need <= 0:
+            return
+        ports = [str(p) for p in cfg["ports"]]
+        touched = {}
+        for p in ports:
+            try:
+                for ip in (self.kernel.members(p) or {}):
+                    if ip in self.whitelist:
+                        continue
+                    touched.setdefault(ip, set()).add(int(p))
+            except Exception:                                # noqa: BLE001
+                continue
+        if not touched:
+            return
+        mode = cfg.get("mode", "observe")
+        block = bool(cfg.get("scan_block", True)) and mode == "enforce"
+        ttl = int(cfg.get("ttl", 3600))
+        for ip, hit_ports in touched.items():
+            if len(hit_ports) < need:
+                continue
+            if now - self.scan_last.get(ip, 0) < self.window:
+                continue
+            self.scan_last[ip] = now
+            detail = "命中 %d 个蜜罐端口：%s" % (
+                len(hit_ports), ",".join(str(p) for p in sorted(hit_ports)[:10]))
+            if block and ip not in self.blocked:
+                self.kernel.add_black(ip)
+                self.store.add_block(ip, 0, len(hit_ports), ttl, "端口扫描（%d 端口）" % len(hit_ports))
+                self.store.event(ip, 0, len(hit_ports), "scan", "自动封禁（端口扫描）", detail)
+                self.stats["blocked"] += 1
+                self.recent_hits.append((now, ip))
+                log("封禁 %s（端口扫描，%d 个端口）" % (ip, len(hit_ports)), "warn")
+            else:
+                self.store.event(ip, 0, len(hit_ports), "scan", "扫描探测", detail)
+                self.stats["events"] += 1
+                self.recent_hits.append((now, ip))
+                log("检测到端口扫描 %s（%d 个端口）" % (ip, len(hit_ports)))
 
     def forget(self, ip):
         """外部（如 HFish 告警）处置后，清掉该 IP 的去抖状态。"""
@@ -1819,8 +2013,9 @@ def health():
         "app": APP_NAME,
         "version": VERSION,
         "auth": True,
-        "kernel": {"kind": MONITOR.kernel.kind, "available": MONITOR.kernel.available,
-                   "reason": MONITOR.kernel.reason},
+        "kernel": dict({"kind": MONITOR.kernel.kind, "available": MONITOR.kernel.available,
+                        "reason": MONITOR.kernel.reason},
+                       **MONITOR.kernel.stats()),
         "fake": FAKE,
         "time": int(time.time()),
     }
@@ -1837,13 +2032,18 @@ def status():
         "window": cfg["window"],
         "poll": cfg["poll"],
         "ttl": cfg["ttl"],
+        "udp": bool(cfg.get("udp", True)),
+        "scan_ports": int(cfg.get("scan_ports", 0) or 0),
+        "scan_block": bool(cfg.get("scan_block", True)),
         "ports": cfg["ports"],
         "whitelist": cfg["whitelist"],
         "blacklist_count": len(STORE.active_blocks()),
         "events_count": STORE.events_count("over"),
         "trap": MONITOR.kernel.trap_present([str(p) for p in cfg["ports"]]),
-        "kernel": {"kind": MONITOR.kernel.kind, "available": MONITOR.kernel.available,
-                   "reason": MONITOR.kernel.reason},
+        "kernel": dict({"kind": MONITOR.kernel.kind,
+                        "available": MONITOR.kernel.available,
+                        "reason": MONITOR.kernel.reason},
+                       **MONITOR.kernel.stats()),
         "degraded": not MONITOR.kernel.available,
         "fake": FAKE,
         "last_poll": MONITOR.last_poll,

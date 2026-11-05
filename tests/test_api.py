@@ -597,5 +597,109 @@ class RateSpecTest(unittest.TestCase):
             self.assertIn(rs(thr, win).split("/", 1)[1], ("second", "minute", "hour", "day"))
 
 
+class ScanDetectTest(ApiBase):
+    """端口扫描面检测：同一源在窗口内命中多个不同蜜罐端口（真实蜜罐数据里
+    出现过的形态——一个源 1 分钟内打了 5 个端口）。"""
+
+    PORTS = [6379, 9200, 9000, 8080, 8081, 9198, 9080]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="hfish-guard-scan-")
+        cls.port = free_port()
+        cls.base = "http://127.0.0.1:%d" % cls.port
+        cls.token = "hg-test-token-scan"
+        with open(os.path.join(cls.tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"mode": "observe", "threshold": 9999, "window": 60, "poll": 1,
+                       "ttl": 600, "token": cls.token, "ports": cls.PORTS,
+                       "whitelist": [], "scan_ports": 4, "scan_block": True,
+                       "udp": True}, f)
+        env = dict(os.environ)
+        env.update({"HFISH_GUARD_FAKE": "1", "HFISH_GUARD_SIM": "0"})
+        cls.proc = subprocess.Popen(
+            [sys.executable, GUARD, "--fake", "--port", str(cls.port), "--data", cls.tmp],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if cls.call("GET", "/api/health", token=None).get("ok"):
+                    return
+            except Exception:
+                pass
+            time.sleep(0.2)
+        raise RuntimeError("守护进程未就绪：\n%s" % (cls.proc.stdout.read() if cls.proc.stdout else ""))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _sweep(self, ip, ports):
+        for p in ports:
+            self.call("POST", "/api/simulate", {"ip": ip, "port": p, "packets": 1})
+
+    def _wait_scan(self, ip, timeout=12):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rows = self.call("GET", "/api/events?limit=200")
+            hit = [r for r in rows if r["ip"] == ip and r["verdict"] == "scan"]
+            if hit:
+                return hit[0]
+            time.sleep(0.4)
+        return None
+
+    def test_01_sweep_below_threshold_no_scan(self):
+        self._sweep("203.0.113.31", self.PORTS[:2])       # 只碰 2 个端口
+        time.sleep(3)
+        rows = self.call("GET", "/api/events?limit=200")
+        self.assertFalse([r for r in rows if r["ip"] == "203.0.113.31"],
+                         "2 个端口不该判成扫描")
+
+    def test_02_sweep_over_threshold_records_scan(self):
+        self._sweep("203.0.113.32", self.PORTS[:5])       # 5 个端口 ≥ scan_ports(4)
+        row = self._wait_scan("203.0.113.32")
+        self.assertIsNotNone(row, "命中 5 个端口应产生 scan 事件")
+        self.assertEqual(row["verdict"], "scan")
+        self.assertEqual(row["action"], "扫描探测")
+        self.assertIn("个蜜罐端口", row["detail"])
+        # 观察模式不封禁
+        self.assertNotIn("203.0.113.32", [b["ip"] for b in self.call("GET", "/api/blacklist")])
+
+    def test_03_scan_blocks_in_enforce(self):
+        self.call("PUT", "/api/config", {"mode": "enforce"})
+        self._sweep("203.0.113.33", self.PORTS[:5])
+        row = self._wait_scan("203.0.113.33")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["action"], "自动封禁（端口扫描）")
+        self.assertIn("203.0.113.33", [b["ip"] for b in self.call("GET", "/api/blacklist")])
+        self.call("DELETE", "/api/blacklist/203.0.113.33")
+
+    def test_04_scan_ports_zero_disables(self):
+        self.call("PUT", "/api/config", {"mode": "observe", "scan_ports": 0})
+        self.assertEqual(self.call("GET", "/api/config")["scan_ports"], 0)
+        self._sweep("203.0.113.34", self.PORTS)
+        time.sleep(3)
+        rows = self.call("GET", "/api/events?limit=200")
+        self.assertFalse([r for r in rows if r["ip"] == "203.0.113.34" and r["verdict"] == "scan"],
+                         "scan_ports=0 应关闭扫描判定")
+
+    def test_05_udp_toggle_persists(self):
+        cfg = self.call("PUT", "/api/config", {"udp": False})
+        self.assertFalse(cfg["config"]["udp"])
+        self.assertFalse(self.call("GET", "/api/config")["udp"])
+        cfg = self.call("PUT", "/api/config", {"udp": True})
+        self.assertTrue(cfg["config"]["udp"])
+
+    def test_06_kernel_reports_ipv6_capability(self):
+        k = self.call("GET", "/api/status")["kernel"]
+        self.assertIn("v6", k, "status.kernel 应说明 IPv6 可用性")
+        self.assertIn("rules", k)
+        self.assertFalse(k["v6"], "fake 内核不模拟 IPv6")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

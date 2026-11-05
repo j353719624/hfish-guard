@@ -2078,6 +2078,17 @@ select.input{background-color:rgba(3,12,24,.72)}
                 <label class="radio-card is-on" id="rcObserve"><input type="radio" name="cfgMode" value="observe" checked><span><b>观察模式（推荐）</b><span>超阈值只记录事件，不写入黑名单。适合上线初期校准阈值，零误封风险。</span></span></label>
                 <label class="radio-card" id="rcEnforce"><input type="radio" name="cfgMode" value="enforce"><span><b>封禁模式</b><span>超阈值源 IP 写入黑名单 ipset 并全端口 DROP，按 TTL 自动过期。</span></span></label>
               </div>
+              <div class="form-grid form-grid--3 mt-16">
+                <div class="field"><label class="field-label" for="cfgUdp">UDP 探测</label>
+                  <select class="input" id="cfgUdp"><option value="1">一并拦截 UDP 扫描</option><option value="0">只处理 TCP</option></select>
+                  <div class="hint">蜜罐端口上的 UDP 探测同样计包（实测占捕获量 71%）</div></div>
+                <div class="field"><label class="field-label" for="cfgScanPorts">端口扫描判定</label>
+                  <input class="input mono" id="cfgScanPorts" type="number" min="0" max="64">
+                  <div class="hint">同一源在窗口内命中多少个不同蜜罐端口算扫描，0=关闭</div></div>
+                <div class="field"><label class="field-label" for="cfgScanBlock">扫描是否封禁</label>
+                  <select class="input" id="cfgScanBlock"><option value="1">是，判定即封禁</option><option value="0">否，只记录</option></select>
+                  <div class="hint">仅封禁模式生效</div></div>
+              </div>
               <div class="form-grid mt-16" style="padding:0">
                 <div class="field"><label class="field-label" for="cfgTtl">黑名单 TTL（秒）<span class="req">*</span></label><input class="input mono" id="cfgTtl" type="number" min="60" max="604800" required><div class="hint">默认 3600s，到期自动过期</div><div class="err" id="cfgTtlErr" role="alert"></div></div>
               </div>
@@ -2235,7 +2246,7 @@ var TARGETS=[
 ];
 
 var state={
-  view:'map',authed:false,mode:'observe',threshold:40,windowSec:60,pollSec:10,ttlSec:3600,
+  view:'map',authed:false,mode:'observe',threshold:40,windowSec:60,pollSec:10,ttlSec:3600,udp:true,scanPorts:6,scanBlock:true,
   token:'hfish-guard-demo',hfish:null,hfishLink:null,hfishConfigured:false,
   ports:[6379,9200,2022,7878,3306,8080,445],
   eventFilter:'all',eventQuery:'',eventPage:1,pageSize:10,
@@ -2271,6 +2282,10 @@ function actionOf(e){
     var blocked=(e.action||'').indexOf('封禁')>=0;
     return {label:blocked?'已封禁':'蜜罐告警',cls:blocked?'red':'blue'};
   }
+  if(e.verdict==='scan'){
+    var b2=(e.action||'').indexOf('封禁')>=0;
+    return {label:b2?'已封禁（扫描）':'扫描探测',cls:b2?'red':'blue'};
+  }
   if(e.verdict==='manual')return {label:'手动封禁',cls:'red'};
   if(e.verdict==='expired')return {label:'TTL 到期解封',cls:'muted'};
   if(e.verdict==='normal')return {label:'仅计包',cls:'muted'};
@@ -2281,6 +2296,7 @@ function verdictTag(v){
   if(v==='over')return '<span class="tag tag--amber">超过阈值</span>';
   if(v==='exempt')return '<span class="tag tag--green">命中白名单</span>';
   if(v==='hfish')return '<span class="tag tag--blue">蜜罐告警</span>';
+  if(v==='scan')return '<span class="tag tag--blue">端口扫描</span>';
   if(v==='manual')return '<span class="tag tag--blue">手动处置</span>';
   if(v==='expired')return '<span class="tag tag--muted">已解封</span>';
   return '<span class="tag tag--muted">未达阈值</span>';
@@ -2438,6 +2454,9 @@ function fillConfig(){
   $('#cfgWindow').value=state.windowSec;
   $('#cfgPoll').value=state.pollSec;
   $('#cfgTtl').value=state.ttlSec;
+  if($('#cfgUdp'))$('#cfgUdp').value=state.udp? '1':'0';
+  if($('#cfgScanPorts'))$('#cfgScanPorts').value=(state.scanPorts===undefined?6:state.scanPorts);
+  if($('#cfgScanBlock'))$('#cfgScanBlock').value=state.scanBlock? '1':'0';
   $('#cfgToken').textContent=state.token;
   $$('input[name="cfgMode"]').forEach(function(r){
     var on=r.value===state.mode;r.checked=on;
@@ -3095,6 +3114,9 @@ $('#cfgForm').addEventListener('submit',function(e){
   state.windowSec=Number($('#cfgWindow').value);
   state.pollSec=Number($('#cfgPoll').value);
   state.ttlSec=Number($('#cfgTtl').value);
+  state.udp=$('#cfgUdp')?$('#cfgUdp').value==='1':true;
+  state.scanPorts=$('#cfgScanPorts')?Number($('#cfgScanPorts').value)||0:6;
+  state.scanBlock=$('#cfgScanBlock')?$('#cfgScanBlock').value==='1':true;
   state.mode=$('input[name="cfgMode"]:checked').value;
   var hfNew={
     enabled:$('#cfgHfishEnabled').value==='1',
@@ -3109,7 +3131,7 @@ $('#cfgForm').addEventListener('submit',function(e){
   var banner=$('#modeBanner');banner.classList.toggle('is-enforce',state.mode==='enforce');
   banner.querySelector('span').textContent=state.mode==='enforce'?'封禁模式 · 超阈值源 IP 将写入黑名单并全端口 DROP':'观察模式 · 超阈值仅记录事件，不下发封禁（最安全默认值）';
   state.lastReload=Date.now();state.cfgDirty=false;
-  if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('config',{mode:state.mode,threshold:state.threshold,window:state.windowSec,poll:state.pollSec,ttl:state.ttlSec,ports:state.ports,hfish:state.hfish});
+  if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('config',{mode:state.mode,threshold:state.threshold,window:state.windowSec,poll:state.pollSec,ttl:state.ttlSec,ports:state.ports,udp:state.udp,scan_ports:state.scanPorts,scan_block:state.scanBlock,hfish:state.hfish});
   renderAll();toast('配置已热加载 · 无需重启 guard.service','ok');
 });
 function updateClock(){
@@ -3642,6 +3664,9 @@ var HG_LIVE=(function(){
     state.hfishLink=(st.link||{}).hfish||null;
     if(cfg&&cfg.hfish){
       state.hfish=cfg.hfish;
+      state.udp=cfg.udp!==false;
+      state.scanPorts=(typeof cfg.scan_ports==='number')?cfg.scan_ports:6;
+      state.scanBlock=cfg.scan_block!==false;
       state.hfishConfigured=!!cfg.hfish.enabled;
       if(cfg.token)state.token=cfg.token;
     }
