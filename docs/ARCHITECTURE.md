@@ -156,7 +156,7 @@ HFish 开放 API ──────► 威胁标签（只读，不参与封禁�
 
 **HFish 停机、升级、换面板端口，guard 照常工作**；只是事件表里少掉「类型/蜜罐/账号/等级」这些富化字段。
 
-### 7.2 通路 A：syslog（推荐，默认开启）
+### 7.2 通路 A：syslog（最省事，推荐）
 
 HFish 面板操作：
 
@@ -209,7 +209,7 @@ guard 配置：
 | `api_key` | 面板生成的那串 | 拼成 `?api_key=` |
 | `verify_tls` | `false` | HFish 默认自签证书，内网保持 false |
 
-拉到的数据只进 `/api/hfish/intel`（威胁标签、累计攻击次数），**不参与封禁决策**——官方这个接口是聚合视图，有分钟级延迟，用它封禁会误伤。拉取失败不影响任何其他功能，状态在 `hfish.api_error` 里。
+拉到的数据只进 `/api/hfish/intel`（威胁标签、累计攻击次数），**不参与封禁决策**——官方这个接口是聚合视图，有分钟级延迟，用它封禁会误伤。拉取失败不影响任何其他功能，状态在 `link.hfish.api_error` 里。
 
 ### 7.5 按等级自动封禁
 
@@ -244,7 +244,7 @@ python fpk/app/bin/guard.py --fake --port 9706 --data ./tmp
 ```
 
 ```bash
-python tests/test_api.py        # 12 个接口端到端用例（鉴权/事件/封禁/白名单/配置/凭证）
+python tests/test_api.py        # 20 个端到端用例（鉴权/事件/封禁/白名单/配置/凭证/HFish 三通路）
 bash scripts/build-fpk.sh       # 产出 dist/hfish-guard.fpk
 ```
 
