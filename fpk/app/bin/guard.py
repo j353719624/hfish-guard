@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.0"
+VERSION = "1.4.3"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -1032,6 +1032,14 @@ def _pick(data, *keys):
     return ""
 
 
+def _strip_syslog_header(text):
+    """去掉 RFC3164/5424 头：<pri>时间 主机 应用[pid]: 正文。"""
+    body = re.sub(r"^<\d{1,3}>", "", str(text or "").strip())
+    # 例：2026-11-06T08:12:44+08:00 fnOS HFish[942440]: {...}
+    body = re.sub(r"^\S+\s+\S+\s+[^:\s]+\s+", "", body, count=1)
+    return body.strip()
+
+
 def parse_hfish_payload(raw):
     """把 syslog 行或 webhook JSON 归一成事件字段；容忍 JSON / key:value / 纯文本三种形态。"""
     data, text = {}, ""
@@ -1048,8 +1056,23 @@ def parse_hfish_payload(raw):
         except ValueError:
             data = {}
     if not data:
-        # HFish syslog 形如：client: node1, src_ip: 1.2.3.4, attack_type: scan, ...
-        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*("([^"]*)"|[^,;\n]+)', text):
+        # HFish 走标准 syslog 通道时，正文前面带 RFC3164/5424 头：
+        #   <4>2026-11-06T08:12:44+08:00 fnOS HFish[942440]: {"src_ip":"...", ...}
+        # 必须先剥掉，否则后面的 key:value 正则会把时间戳 "T08:12:44" 当成字段，
+        # 字典被写脏后就再也取不到 src_ip —— 真机上表现为「全量 skipped」。
+        body = _strip_syslog_header(text)
+        m = re.search(r"\{.*\}", body, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                if isinstance(obj, dict):
+                    data = obj
+            except ValueError:
+                data = {}
+    if not data:
+        # HFish 自定义 webhook / 老格式：client: node1, src_ip: 1.2.3.4, ...
+        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*("([^"]*)"|[^,;\n]+)',
+                             _strip_syslog_header(text)):
             data[m.group(1)] = (m.group(3) if m.group(3) is not None else m.group(2)).strip().strip('"')
         if not data:
             m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
@@ -1092,6 +1115,8 @@ class Ingest:
         self.lock = threading.Lock()
         self.seen = {}
         self.counts = {"syslog": 0, "webhook": 0, "skipped": 0, "last": 0}
+        self.last_bad_log = 0.0
+        self.last_raw = ""          # 最近一条解析失败的原始报文（排查格式用）
 
     def push(self, payload, via="syslog"):
         data = parse_hfish_payload(payload)
@@ -1099,8 +1124,28 @@ class Ingest:
         if not valid_ip(ip):
             with self.lock:
                 self.counts["skipped"] += 1
+                self.counts["last_raw"] = str(payload)[:400]
+                now = time.time()
+                noisy = now - self.last_bad_log > 60
+                if noisy:
+                    self.last_bad_log = now
+            if noisy:   # 每分钟只打一条，免得把 journald 刷爆
+                log("syslog 无法解析（缺 src_ip），原样：%r" % (str(payload)[:300],), "warn")
             return None
         cfg = self.store.cfg
+        # 扫描感知的噪声：HFish 把「扫描感知」传感器端口上的广播/组播也算成 scan 告警，
+        # 真机上 11 万条里绝大多数是同网段 IPv6 的 mDNS/SSDP/BT 流量，不是打蜜罐的。
+        # 判定：attack_type=scan 且目标端口不在我们监视的蜜罐端口列表里 → 丢弃。
+        if data.get("attack_type") == "scan":
+            try:
+                watched = set(int(p) for p in cfg.get("ports", []))
+            except (TypeError, ValueError):
+                watched = set()
+            if data.get("port") and int(data["port"]) not in watched:
+                with self.lock:
+                    self.counts["skipped"] += 1
+                    self.counts["noise"] = self.counts.get("noise", 0) + 1
+                return None
         if ip in Whitelist(cfg.get("whitelist", [])):
             with self.lock:
                 self.counts["skipped"] += 1

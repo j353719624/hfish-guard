@@ -333,6 +333,20 @@ class HfishIngestTest(ApiBase):
         sock.close()
         time.sleep(0.6)
 
+    def test_00_scan_sensor_noise_is_dropped(self):
+        """扫描感知把传感器端口上的广播流量也算 scan 告警，必须过滤掉，
+        否则 11 万条噪声会把事件表刷满（真机实测）。"""
+        body = {"src_ip": "198.51.100.44", "attack_type": "scan",
+                "scan_port": 63219, "threat_level": "low"}
+        r = urllib.request.Request(self.base + "/api/hfish/webhook?k=wh-secret",
+                                   data=json.dumps(body).encode(), method="POST",
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            res = json.loads(resp.read().decode())
+        self.assertEqual(res.get("accepted", 0), 0, "传感器端口噪声不应被接受")
+        rows = self.call("GET", "/api/events?limit=100")
+        self.assertNotIn("198.51.100.44", [x["ip"] for x in rows])
+
     def test_01_syslog_event_and_auto_block(self):
         self.syslog({"client": "node1", "src_ip": "203.0.113.201", "attack_type": "signon",
                      "class": "SSH", "account": "root/123456", "threat_level": "high",
@@ -709,6 +723,57 @@ class ScanDetectTest(ApiBase):
         self.assertIn("v6", k, "status.kernel 应说明 IPv6 可用性")
         self.assertIn("rules", k)
         self.assertFalse(k["v6"], "fake 内核不模拟 IPv6")
+
+
+class HfishPayloadTest(unittest.TestCase):
+    """HFish 真实 syslog 报文解析（真机踩过的坑：带 RFC3164 头）。
+
+    线上原文：
+      <4>2026-11-06T08:12:44+08:00 fnOS HFish[942440]: {"title":"HFish Threat Alert",
+       ..., "src_ip":"2409:...","attack_type":"scan",...}
+    旧实现先整体 json.loads（失败）再跑 key:value 正则，正则先把时间戳里的
+    "T08:12:44" 当成字段，字典写脏后 src_ip 取不到 —— 表现为全量 skipped。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("guard_mod2", GUARD)
+        cls.g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.g)
+
+    def test_rfc3164_header_with_json_body(self):
+        raw = ('<4>2026-11-06T08:12:44+08:00 fnOS HFish[942440]: {"title":"HFish Threat Alert",'
+               '"client":"内置节点","client_ip":"192.168.110.97","attack_type":"scan",'
+               '"scan_type":"UDP","scan_port":"63219","class":"","type":"","name":"","account":"",'
+               '"src_ip":"2409:8a20:4c84:6200:d65e:4eb0:8dc4:93aa","src_port":"13873",'
+               '"dst_ip":"192.168.110.97","dst_port":"63219","threat_level":"low",'
+               '"info":"扫描感知","time":"2026-11-06 08:12:44"}')
+        d = self.g.parse_hfish_payload(raw)
+        self.assertEqual(d["ip"], "2409:8a20:4c84:6200:d65e:4eb0:8dc4:93aa")
+        self.assertEqual(d["port"], 63219)
+        self.assertEqual(d["attack_type"], "scan")
+        self.assertEqual(d["level"], "low")
+        self.assertTrue(self.g.valid_ip(d["ip"]))
+
+    def test_plain_json(self):
+        d = self.g.parse_hfish_payload(
+            '{"src_ip":"203.0.113.5","attack_type":"signon","threat_level":"high"}')
+        self.assertEqual(d["ip"], "203.0.113.5")
+
+    def test_key_value_line(self):
+        d = self.g.parse_hfish_payload(
+            "client: node1, src_ip: 1.2.3.4, attack_type: signon, threat_level: high")
+        self.assertEqual(d["ip"], "1.2.3.4")
+
+    def test_plain_text_fallback(self):
+        d = self.g.parse_hfish_payload("some random line 198.51.100.7 hit us")
+        self.assertEqual(d["ip"], "198.51.100.7")
+
+    def test_header_stripped_for_key_value(self):
+        d = self.g.parse_hfish_payload(
+            "<134>Nov  6 08:12:44 fnOS HFish[942440]: client: n1, src_ip: 198.51.100.9")
+        self.assertEqual(d["ip"], "198.51.100.9")
 
 
 if __name__ == "__main__":

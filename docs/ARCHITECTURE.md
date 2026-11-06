@@ -209,6 +209,20 @@ guard 侧：UI「配置 → HFish 联动」里勾「接入 HFish 告警」，sys
 
 解析是**容错的**：JSON、`key: value`、`key=value`、甚至只有一行带 IP 的纯文本都能吃；系统告警（节点离线、蜜罐离线）没有 `src_ip`，会被计入 `received.skipped` 而不是当成攻击。
 
+### 7.2.1 真机接入踩到的三个坑（v1.4.2/1.4.3 已修）
+
+1. **HFish 的库不一定是 SQLite**。本机 `hfish-data/config.toml` 写的是 `type = "mysql"`，
+   真实数据在 Docker 里的 MySQL（库名 `HFish`）；`hfish-data/database/hfish.db` 只是安装当天的旧快照。
+   查数据前先确认：`docker ps | grep mysql` + `docker inspect mysql --format '{{.Config.Env}}'`。
+2. **syslog 正文前面有 RFC3164/5424 头**：
+   `<4>2026-11-06T08:12:44+08:00 fnOS HFish[942440]: {"src_ip":"...",...}`。
+   旧解析器先整体 `json.loads`（失败），再跑 `key: value` 正则，结果正则先把时间戳里的
+   `T08:12:44` 当成字段，字典被写脏 → `src_ip` 取不到 → 真机上 7 万条全进 `skipped`。
+   现在先剥头再找 JSON 对象，最后才退回键值解析。
+3. **扫描感知的“噪声告警”**：HFish 把传感器端口（63219）上收到的 mDNS/SSDP/BT 广播也判成
+   `attack_type=scan` 并发告警，真机一小时就 12 万条。守卫现在按「scan 且目标端口不在监视列表」
+   直接丢弃，只累加 `received.noise` 计数，不写事件表。
+
 ### 7.3 通路 B：webhook（自定义）
 
 HFish：**通知配置 → webhook → 自定义**，URL 填
