@@ -147,9 +147,9 @@ body[data-demo] .demo-banner{display:flex}
 .topbar-brand .ver{font-family:var(--mono);font-size:10.5px;color:var(--t3);border:1px solid var(--line-2);padding:1px 5px;border-radius:2px;margin-left:2px}
 .topbar-status{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);white-space:nowrap}
 .topbar-spacer{flex:1}
-.topbar-meta{display:flex;align-items:center;gap:16px}
-.mode-toggle{display:flex;border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden}
-.mode-toggle button{padding:6px 12px;background:transparent;border:0;color:var(--t3);font-size:12px;font-weight:500;transition:all var(--fast);white-space:nowrap}
+.topbar-meta{display:flex;align-items:center;gap:16px;flex:0 0 auto}
+.mode-toggle{display:flex;flex:0 0 auto;border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden}
+.mode-toggle button{flex:0 0 auto;padding:6px 12px;background:transparent;border:0;color:var(--t3);font-size:12px;font-weight:500;transition:all var(--fast);white-space:nowrap;line-height:1.4;min-width:56px}
 .mode-toggle button+button{border-left:1px solid var(--line-2)}
 .mode-toggle button:hover{color:var(--t1);background:var(--ink-300)}
 .mode-toggle button.is-on{background:var(--amber-soft);color:var(--amber)}
@@ -2398,6 +2398,30 @@ function renderRecent(){
     return '<tr><td class="mono dim" style="width:78px">'+fmtTime(e.ts)+'</td><td class="mono" style="color:var(--t1)">'+esc(e.ip)+' <span class="geo-mini">'+geoOf(e.ip).cc+'</span></td><td class="mono dim" style="width:56px">'+e.port+'</td><td style="text-align:right"><span class="act act--'+a.cls+'">'+a.label+'</span></td></tr>';
   }).join('');
 }
+/* 顶栏模式按钮 / 横幅 / 配置页单选框的唯一渲染入口。
+   之前这三处各写一遍，导致：后端改了模式顶栏不更新；点击后又被 sync 拉回。 */
+function applyModeUI(){
+  var m=state.mode==='enforce'?'enforce':'observe';
+  $$('[data-mode]').forEach(function(x){
+    var on=x.dataset.mode===m;
+    x.classList.toggle('is-on',on);
+    x.setAttribute('aria-pressed',String(on));
+  });
+  var banner=$('#modeBanner');
+  if(banner){
+    var span=banner.querySelector('span');
+    if(span)span.textContent=m==='enforce'
+      ?'封禁模式 · 超阈值源 IP 将写入黑名单并全端口 DROP'
+      :'观察模式 · 超阈值仅记录事件，不下发封禁（最安全默认值）';
+    banner.classList.toggle('is-enforce',m==='enforce');
+  }
+  $$('input[name="cfgMode"]').forEach(function(r){
+    var on=r.value===m;r.checked=on;
+    var card=$('#'+(r.value==='observe'?'rcObserve':'rcEnforce'));
+    if(card)card.classList.toggle('is-on',on);
+  });
+}
+
 function renderStatus(){
   var win=sumPackets();
   $('#kpiPackets').textContent=state.totalPackets.toLocaleString('en-US');
@@ -2419,6 +2443,7 @@ function renderStatus(){
   $('#polWhite').textContent=state.whitelist.length+' 条 · 即时同步';
   $('#polReload').textContent=Math.max(0,Math.floor((Date.now()-state.lastReload)/60000))+' 分钟前';
   $('#cfgReload').textContent=Math.max(0,Math.floor((Date.now()-state.lastReload)/60000))+' 分钟前';
+  applyModeUI();
   renderChart();renderPortRows();renderRecent();
 }
 function filteredEvents(){
@@ -3020,20 +3045,21 @@ $('#gateForm').addEventListener('submit',function(e){
 });
 $$('[data-nav]').forEach(function(b){b.addEventListener('click',function(){setView(b.dataset.nav);});});
 $$('[data-mode]').forEach(function(b){b.addEventListener('click',function(){
-  state.mode=b.dataset.mode;
-  $$('[data-mode]').forEach(function(x){
-    var on=x.dataset.mode===state.mode;
-    x.classList.toggle('is-on',on);x.setAttribute('aria-pressed',String(on));
-  });
-  var banner=$('#modeBanner'),span=banner.querySelector('span');
-  span.textContent=state.mode==='enforce'?'封禁模式 · 超阈值源 IP 将写入黑名单并全端口 DROP':'观察模式 · 超阈值仅记录事件，不下发封禁（最安全默认值）';
-  banner.classList.toggle('is-enforce',state.mode==='enforce');
-  $$('input[name="cfgMode"]').forEach(function(r){
-    var on=r.value===state.mode;r.checked=on;
-    $('#'+(r.value==='observe'?'rcObserve':'rcEnforce')).classList.toggle('is-on',on);
-  });
+  var want=b.dataset.mode;
+  if(want!=='enforce'&&want!=='observe')return;
+  if(want===state.mode){applyModeUI();return;}
+  var prev=state.mode;
+  state.mode=want;
+  applyModeUI();
   renderStatus();renderEvents();
-  toast(state.mode==='enforce'?'已切换为封禁模式':'已切换为观察模式（安全默认）',state.mode==='enforce'?'warn':'ok');
+  /* 关键：必须落库。原来只改本地 state，下一次 sync 就被后端值拉回去。 */
+  if(window.HG_LIVE&&HG_LIVE.live){
+    HG_LIVE.push('config',{mode:want});
+    toast(want==='enforce'?'正在切换为封禁模式 · 内核规则同步生效':'正在切换为观察模式（安全默认）',want==='enforce'?'warn':'ok');
+  }else{
+    toast('演示模式：模式切换仅影响本地显示','warn');
+  }
+  void prev;
 });});
 $$('[data-filter]').forEach(function(b){b.addEventListener('click',function(){
   state.eventFilter=b.dataset.filter;state.eventPage=1;
@@ -3224,9 +3250,7 @@ $('#cfgForm').addEventListener('submit',function(e){
     webhook_token:$('#cfgHfishWtok').value.trim()
   };
   state.hfish=hfNew;
-  $$('[data-mode]').forEach(function(x){var on=x.dataset.mode===state.mode;x.classList.toggle('is-on',on);x.setAttribute('aria-pressed',String(on));});
-  var banner=$('#modeBanner');banner.classList.toggle('is-enforce',state.mode==='enforce');
-  banner.querySelector('span').textContent=state.mode==='enforce'?'封禁模式 · 超阈值源 IP 将写入黑名单并全端口 DROP':'观察模式 · 超阈值仅记录事件，不下发封禁（最安全默认值）';
+  applyModeUI();
   state.lastReload=Date.now();state.cfgDirty=false;
   if(window.HG_LIVE&&HG_LIVE.live)HG_LIVE.push('config',{mode:state.mode,threshold:state.threshold,window:state.windowSec,poll:state.pollSec,ttl:state.ttlSec,ports:state.ports,udp:state.udp,scan_ports:state.scanPorts,scan_block:state.scanBlock,hfish:state.hfish});
   renderAll();toast('配置已热加载 · 无需重启 guard.service','ok');
@@ -3260,8 +3284,12 @@ function tick(){
 }
 
 /* ---------------- 自检（无头浏览器烟测） ---------------- */
+/* 自检断言条数：构建时由 scripts/build-fpk.sh 自动统计 errs.push 数量后注入，
+   避免手工维护的数字与实际断言脱节（之前写死 54，加了断言忘了改）。 */
+var SELFTEST_CHECKS=61; /* __SELFTEST_CHECKS__ */
 function runSelfTest(){
   var errs=bootErrors.slice();
+  /* 断言条数由构建时注入的 SELFTEST_CHECKS 反映，与实际 errs.push 数一致 */
   try{
     if(!$('#gate')||$('#gate').hidden)errs.push('gate:missing');
     $('#tokenInput').value='hfish-guard-demo';
@@ -3337,6 +3365,26 @@ function runSelfTest(){
     $('[data-filter="over"]').click();
     if($$('#eventRows tr[data-event]').length<1)errs.push('filter:empty');
     $('[data-filter="all"]').click();
+    /* 模式切换：按钮必须能被点到、且点完 UI 与 state.mode 一致。
+       回归：处理函数里条件写错（运算符优先级）导致点击被短路，
+       按钮点了没反应、模式永远切不过去。 */
+    var mt=$$('.mode-toggle button');
+    if(mt.length!==2)errs.push('mode:buttons');
+    else{
+      var m0=state.mode;
+      var target=(m0==='enforce')?mt[0]:mt[1];
+      target.click();
+      if(state.mode===m0)errs.push('mode:click');
+      var onBtn=mt.filter(function(b){return b.classList.contains('is-on')});
+      if(onBtn.length!==1)errs.push('mode:highlight');
+      else if(onBtn[0].dataset.mode!==state.mode)errs.push('mode:match');
+      var mb=$('#modeBanner');
+      if(!mb)errs.push('mode:banner');
+      else if(mb.classList.contains('is-enforce')!==(state.mode==='enforce'))errs.push('mode:banner');
+      /* 切回原模式，别影响后续自检 */
+      (m0==='enforce'?mt[1]:mt[0]).click();
+      if(state.mode!==m0)errs.push('mode:restore');
+    }
     $('[data-nav="whitelist"]').click();
     var before=state.whitelist.length;
     $('#wlCidr').value='203.0.113.0/24';$('#wlNote').value='自检条目';
@@ -3357,7 +3405,7 @@ function runSelfTest(){
     if(ext!==0)errs.push('external-assets:'+ext);
   }catch(ex){errs.push('exception:'+ex.message);}
   var out=$('#selftest-result');out.hidden=false;
-  out.textContent='SELFTEST '+(errs.length?'FAIL :: '+errs.join(' | '):'PASS')+' :: checks=54 :: js-errors='+bootErrors.length+' :: innerW='+window.innerWidth+' :: scrollW='+document.documentElement.scrollWidth;
+  out.textContent='SELFTEST '+(errs.length?'FAIL :: '+errs.join(' | '):'PASS')+' :: checks='+SELFTEST_CHECKS+' :: js-errors='+bootErrors.length+' :: innerW='+window.innerWidth+' :: scrollW='+document.documentElement.scrollWidth;
   document.title=out.textContent;
 }
 

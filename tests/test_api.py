@@ -313,6 +313,44 @@ class GuardApiTest(ApiBase):
                          ("KR", "韩国"), ("TW", "中国台湾"), ("HK", "中国香港")):
             self.assertEqual(g.CC_ZH.get(cc), name, "%s 的中文名不对" % cc)
 
+    def test_10_mode_switch_persists_to_disk(self):
+        """顶栏「封禁模式」按钮必须真正落库。
+
+        回归：按钮只改浏览器本地 state，从未推给后端，下一次 sync 就被
+        apply() 里的 state.mode=st.mode 拉回 observe —— 用户表现为
+        「点了封禁模式，关掉再打开又变回观察模式」。
+        """
+        cfg = self.call("GET", "/api/config")
+        self.assertEqual(cfg["mode"], "observe", "前置条件：初始应为观察模式")
+
+        # 模拟顶栏按钮的请求：只带 mode 一个键
+        res = self.call("PUT", "/api/config", {"mode": "enforce"})
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res["config"]["mode"], "enforce")
+
+        # 运行态已切换
+        st = self.call("GET", "/api/status")
+        self.assertEqual(st["mode"], "enforce")
+
+        # 关键：已落盘（重新读文件，不是读内存里的 cfg）
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved.get("mode"), "enforce", "mode 必须写进 config.json")
+
+        # 切回来，保持其它测试的基线
+        self.call("PUT", "/api/config", {"mode": "observe"})
+
+    def test_10b_mode_only_patch_keeps_other_settings(self):
+        """只传 mode 时，其它配置项不能被清掉（apply_patch 必须是增量）。"""
+        before = self.call("GET", "/api/config")
+        self.call("PUT", "/api/config", {"mode": "enforce"})
+        after = self.call("GET", "/api/config")
+        self.assertEqual(after["mode"], "enforce")
+        for k in ("threshold", "window", "poll", "ttl", "ports", "whitelist", "token"):
+            self.assertEqual(after.get(k), before.get(k), "%s 不应被 mode 补丁改动" % k)
+        self.call("PUT", "/api/config", {"mode": "observe"})
+
     def test_11_static_ui(self):
         code, body = self.call("GET", "/", raw=True)
         self.assertEqual(code, 200)

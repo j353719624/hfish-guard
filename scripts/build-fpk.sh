@@ -21,6 +21,10 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/pkg"
 
+# 注入自检断言条数（统计 runSelfTest 里的 errs.push 数量并写回页面）
+# 以前页面里写死 checks=54，加了新断言忘了改数字，自检就会显示得比实际覆盖多。
+python3 "$ROOT/scripts/inject-selftest-count.py" "$SRC/app/ui/index.html"
+
 # 应用文件单独打成 app.tgz，再和 cmd/config/图标一起组成 fpk
 # 排除编译缓存/临时文件（本机 py_compile 会生成 115KB 的 __pycache__，不该进包）
 tar -czf "$TMP/pkg/app.tgz" -C "$SRC/app" \
