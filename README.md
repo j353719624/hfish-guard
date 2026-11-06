@@ -32,6 +32,29 @@
 
 现在改成：内核用 `hashlimit` 直接判定（`--hashlimit-above 阈值/窗口 --hashlimit-burst 阈值`，`--hashlimit-mode srcip`），用户态只负责「取走命中 → 落库 → 管 TTL」。流量曲线仍读每条端口规则自己的包计数器（`iptables -vnxL` 的精确值），所以态势图上的数值是真的。
 
+## 访问凭证
+
+面板的 Token 存在 `/vol2/@appdata/hfish-guard/config.json` 的 `token` 字段
+（权限 0600、属主 root）。获取方式按「是否已进入面板」分两种：
+
+| 场景 | 方式 |
+|---|---|
+| 已在面板内 | 左侧导航「配置 → 接口鉴权」页，有 token 与复制按钮 |
+| 还没进去 | ① 从**飞牛桌面图标**打开（自动带凭证）<br>② 在 NAS 上执行 `curl -s http://127.0.0.1:9705/api/token-local`（仅回环可用）<br>③ `sudo cat /vol2/@appdata/hfish-guard/config.json` 取 token 字段 |
+
+### 分级策略（v1.7.0）
+
+页面入口的「自动补 token」**只对内网来源生效**：
+
+- **内网**（回环 / RFC1918 / 链路本地 / ULA）→ 302 自动补上 token，进门即用
+- **外网** → 不补，停在凭证门，必须手填 token
+
+这样日常从家里/局域网访问零摩擦，而面板若被暴露到公网，不会因为
+「自动补 token」而变成公开页面。判定用显式网段清单（`_is_local_request`），
+不依赖 `ipaddress.is_private`（那个随 Python 版本变，3.13 与 3.9 结论相反）。
+
+> CGNAT（100.64.0.0/10）刻意**不算**内网 —— 那是运营商级 NAT，范围太大。
+
 ## 归属地（GeoIP）
 
 事件表里的「归属地」来自 IP 地理库，数据源按优先级取：

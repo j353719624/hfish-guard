@@ -136,6 +136,16 @@ body[data-demo] .demo-banner{display:flex}
 .demo-banner b{color:#FFD79A}
 .gate-form{display:flex;flex-direction:column;gap:14px}
 .gate-foot{margin-top:22px;padding-top:16px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--t3)}
+.gate-how{margin:0 0 20px;padding:14px 16px;border:1px solid var(--line-2);border-radius:var(--r);background:var(--ink-200)}
+.gate-how-t{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+.gate-how-t b{font-size:13px;color:var(--t1)}
+.gate-how-t span{font-size:11.5px;color:var(--t3)}
+.gate-how-l{margin:0;padding-left:20px;font-size:12.5px;line-height:1.9;color:var(--t2)}
+.gate-how-l code{display:inline-block;margin:2px 0;padding:2px 7px;border-radius:5px;background:var(--ink-300);border:1px solid var(--line-2);font-size:11.5px;color:var(--cyan);word-break:break-all}
+.gate-how-l .dim{color:var(--t3)}
+.gate-how-n{margin:10px 0 0;padding-top:10px;border-top:1px dashed var(--line-2);font-size:11.5px;color:var(--t3)}
+.gate-how-n b{color:var(--t2)}
+.gate-conn{display:block;margin-bottom:8px;color:var(--green);font-size:12.5px}
 .gate-demo{font-family:var(--mono);color:var(--amber);background:var(--amber-soft);padding:3px 8px;border-radius:2px;cursor:pointer;border:1px dashed rgba(232,163,61,.4)}
 
 /* ---------- 应用骨架 ---------- */
@@ -558,6 +568,13 @@ select.input{background-color:rgba(3,12,24,.72)}
 .gate-rule{background:linear-gradient(90deg,var(--neon-cyan),rgba(122,184,255,.5),transparent)}
 .gate-title{color:#EAF8FF;text-shadow:0 0 26px rgba(122,184,255,.3)}
 .gate-sub{color:#A3C0DA}
+.gate-how{border-color:rgba(96,178,224,.22);background:rgba(3,12,24,.42)}
+.gate-how-t b{color:#DCEAF6}
+.gate-how-l{color:#A3C0DA}
+.gate-how-l code{background:rgba(91,231,245,.08);border-color:rgba(96,178,224,.26);color:#9FF4FF}
+.gate-how-n{border-top-color:rgba(96,178,224,.18);color:#7C9BB8}
+.gate-conn{color:#7DF3C4}
+.gate-how-n b{color:#A3C0DA}
 .gate-demo{color:#8DF1FF;border-color:rgba(91,231,245,.45);background:rgba(91,231,245,.09)}
 
 /* ============================================================
@@ -1511,7 +1528,20 @@ select.input{background-color:rgba(3,12,24,.72)}
     </div>
     <div class="gate-rule"></div>
     <h1 class="gate-title">接入凭证校验</h1>
-    <p class="gate-sub">控制台与守卫守护进程同机部署。请输入接口 Token 以读取状态、事件与黑白名单，凭证仅保存在本次会话。<br><b>Token 在哪</b>：应用左侧「配置 → 接口鉴权」页（复制按钮旁）；或 NAS 上 <code>/vol2/@appdata/hfish-guard/config.json</code> 的 <code>token</code> 字段。从飞牛桌面图标打开会自动带上凭证，无需手填。</p>
+    <p class="gate-sub">控制台与守卫守护进程同机部署。请输入接口 Token 以读取状态、事件与黑白名单，凭证仅保存在本次会话。</p>
+    <div class="gate-how">
+      <div class="gate-how-t"><b>Token 从哪拿</b><span>下面三种方式都不需要先进入本页面</span></div>
+      <ol class="gate-how-l">
+        <li><b>最省事</b>：直接关掉这个页面，从<b>飞牛桌面的应用图标</b>打开，会自动带上凭证。</li>
+        <li><b>在 NAS 上执行</b>（SSH 或终端）：
+          <code>curl -s http://127.0.0.1:9705/api/token-local</code>
+          <span class="dim">返回 JSON 里的 token 字段就是</span></li>
+        <li><b>读配置文件</b>：
+          <code>sudo cat /vol2/@appdata/hfish-guard/config.json</code>
+          <span class="dim">取其中的 token 字段</span></li>
+      </ol>
+      <p class="gate-how-n">已经进过一次了？左侧导航<b>「配置 → 接口鉴权」</b>页有 token 与复制按钮。</p>
+    </div>
     <form class="gate-form" id="gateForm" novalidate>
       <div class="field">
         <label class="field-label" for="tokenInput">API TOKEN<span class="req">*</span></label>
@@ -3689,20 +3719,27 @@ var HG_LIVE=(function(){
 
   function onDetected(h){
     detected=true;
+    /* 不要覆写 .gate-foot：HTML 里已经有「Token 从哪拿」区块和演示按钮(#hgDemoIn2)，
+       原来整块 innerHTML 覆写会把新指引改回旧版，还多出一个重复的演示按钮。 */
     var foot=document.querySelector('.gate-foot');
     if(foot){
-      foot.innerHTML='<span>Token 在左侧「配置 → 接口鉴权」页；或 NAS 上 '
-        + '/vol2/@appdata/hfish-guard/config.json 的 token 字段</span>'+
-        '<button type="button" class="gate-demo" id="hgDemoIn" '
-        + 'title="不连接后端，用内置样例数据看看界面长什么样（数据是假的，不是真实监控）">'
-        + '预览界面（演示数据，非真实监控）</button>';
-      var b=$('#hgDemoIn');
-      if(b)b.addEventListener('click',enterDemo);
+      var oldTxt=foot.querySelector('span');
+      if(oldTxt){oldTxt.remove();}
+      var tip=document.createElement('span');
+      tip.textContent='REST · Token 鉴权';
+      foot.appendChild(tip);
     }
     var ver=document.querySelector('.topbar-brand .ver');
     if(ver&&h&&h.version)ver.textContent='v'+h.version;
     var sub=document.querySelector('.gate-sub');
-    if(sub)sub.textContent='已连接本机 guard.py 守护进程。请输入安装时生成的接口 Token，凭证仅保存在本次会话。';
+    /* 副标题改为追加「已连接」提示，不再整句覆写（覆写会把新说明冲掉） */
+    if(sub&&h&&!sub.getAttribute('data-detected')){
+      sub.setAttribute('data-detected','1');
+      var em=document.createElement('span');
+      em.className='gate-conn';
+      em.textContent='已连接本机 guard.py 守护进程';
+      sub.insertBefore(em,sub.firstChild);
+    }
     badge();
   }
 

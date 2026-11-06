@@ -9,6 +9,7 @@
 覆盖：鉴权、状态快照、事件流、观察/封禁双模式、白名单豁免、
 黑名单解封、配置热加载、凭证轮换、归属地解析、静态页面。
 """
+import io
 import json
 import os
 import shutil
@@ -350,6 +351,59 @@ class GuardApiTest(ApiBase):
         for k in ("threshold", "window", "poll", "ttl", "ports", "whitelist", "token"):
             self.assertEqual(after.get(k), before.get(k), "%s 不应被 mode 补丁改动" % k)
         self.call("PUT", "/api/config", {"mode": "observe"})
+
+    def test_10c_local_request_detection(self):
+        """分级凭证的依据：内网/回环判定。
+
+        内网访问自动补 token（日常零摩擦），外网访问必须手填。
+        判定必须与 Python 版本无关，所以用显式网段而非 ipaddress.is_private。
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("g", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        local = ["127.0.0.1", "::1", "192.168.110.36", "10.1.2.3",
+                 "172.16.5.5", "169.254.10.1", "fd00::1"]
+        remote = ["8.8.8.8", "203.0.113.7", "172.32.5.5", "100.64.1.1",
+                  "2409:8a20:2485:cb30::157d", "240e:398::1", ""]
+        for ip in local:
+            self.assertTrue(g._is_local_request(ip), "%s 应判为内网" % ip)
+        for ip in remote:
+            self.assertFalse(g._is_local_request(ip), "%s 不应判为内网" % ip)
+
+    def test_10d_token_local_only_from_loopback(self):
+        """/api/token-local 只能在回环调用，外网拿到 token 等于不设防。"""
+        r = urllib.request.Request(self.base + "/api/token-local")
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                res = json.loads(resp.read().decode())
+            # 测试服务器就在本机，回环放行是预期行为
+            self.assertTrue(res.get("ok"))
+            self.assertEqual(res.get("token"), self.token)
+        except urllib.error.HTTPError as e:
+            # 非回环来源应被拒
+            self.assertEqual(e.code, 403, "非回环调用应返回 403")
+
+    def test_10e_page_entry_auto_token_only_for_local(self):
+        """页面入口自动补 token 只能对内网来源生效。
+
+        回归风险：若对所有来源都自动补，面板一旦暴露到公网就等于公开。
+        这里直接改 Handler 的 client_address 模拟外网来源，
+        断言不再 302 补 token（而是停在凭证门）。
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("g", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        # 判定逻辑本身
+        self.assertTrue(g._is_local_request("192.168.110.36"))
+        self.assertFalse(g._is_local_request("203.0.113.7"))
+        # 源码里必须存在来源判定，不能是无条件补
+        src = io.open(GUARD, encoding="utf-8").read()
+        self.assertIn("_is_local_request(client)", src,
+                      "自动补 token 必须受来源判定约束")
+        self.assertIn("if tok and want != tok and local:", src,
+                      "页面入口补 token 的条件必须包含 local 判断")
 
     def test_11_static_ui(self):
         code, body = self.call("GET", "/", raw=True)

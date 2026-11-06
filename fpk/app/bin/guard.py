@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -465,6 +465,31 @@ def ip_int(s):
     for part in s.split("."):
         n = (n << 8) + int(part)
     return n
+
+
+def _is_local_request(addr):
+    """判断请求来源是否属于「本机/内网」。
+
+    用于分级凭证：内网访问自动补 token，外网访问必须手填。
+    判定范围：回环、RFC1918 私有段、链路本地、ULA、IPv4-mapped。
+    CGNAT(100.64/10) 刻意不算内网 —— 它是运营商级 NAT，范围太大。
+    """
+    if not addr:
+        return False
+    try:
+        ip = ipaddress.ip_address(str(addr).strip())
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if ip.version == 4:
+        return ip in ipaddress.ip_network("10.0.0.0/8") or \
+               ip in ipaddress.ip_network("172.16.0.0/12") or \
+               ip in ipaddress.ip_network("192.168.0.0/16") or \
+               ip.is_link_local
+    return ip in ipaddress.ip_network("fc00::/7") or ip.is_link_local
 
 
 def _truthy(val, default=False):
@@ -2273,7 +2298,11 @@ class Handler(BaseHTTPRequestHandler):
             # 不用再让人去找「凭证在配置页哪里」。
             want = first("token")
             tok = (STORE.cfg.get("token") if STORE else "") or ""
-            if tok and want != tok:
+            # 分级凭证：只有内网来源才自动补 token。
+            # 面板若被暴露到公网，外网访问会停在凭证门，必须手填。
+            client = self.client_address[0] if self.client_address else ""
+            local = _is_local_request(client)
+            if tok and want != tok and local:
                 # 保留其他 query 参数（?demo=1 / ?selftest=1 之类），只换掉 token
                 params = {k: v for k, v in query.items() if k != "token"}
                 params["token"] = [tok]
@@ -2292,6 +2321,14 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             if path == "/api/health":
                 self._json(health())
+                return
+            if path == "/api/token-local":
+                # 只允许回环调用：在 NAS 上 curl 127.0.0.1:9705 就能自取 token，
+                # 不需要 SSH 读文件、也不需要先进页面。
+                client = self.client_address[0] if self.client_address else ""
+                if client not in ("127.0.0.1", "::1"):
+                    raise ApiError(403, "仅允许本机回环调用")
+                self._json({"ok": True, "token": (STORE.cfg.get("token") if STORE else "")})
                 return
             self._require_auth()
             if path == "/api/status":
