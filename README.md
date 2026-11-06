@@ -55,6 +55,8 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 
 **要“收到就封”必须选 `all`**：HFish 对蜜罐命中给的等级是 `other`，不是 `high`/`mid`。只配 `high` 的话，真机上一条都不会封（实测 14 条蜜罐告警全是 `other`）。`all` 表示不挑等级（含未标等级），配合熔断与容量上限使用。
 
+**扫描类告警按源聚合**：一台专业扫描器一小时能打 200 多个端口（真机：204.76.203.212 扫了 207 个）。所以扫描类不按条封，而是按源累计——命中 `scan_fanout` 个**不同端口**才判定为扫描者并封一次；事件表按「每源每 10 分钟一条汇总」记，不会被扫端口的洪水刷爆。
+
 联通状态在 `/api/status` 的 `link.hfish` 字段：`syslog_bound`（`{"udp":true,"tcp":true}`）、`received`（`{"syslog":N,"webhook":N,"skipped":N}`）、`api_ok` / `api_error` / `intel_count`。**改 syslog 端口或开关联动都即时生效**（接收器按配置重绑，不用重启进程）。
 
 > 安全：**4433 绝不要映射到公网**（官方安全声明原话），守卫拉 API 走 `127.0.0.1`；9705 只对 LAN 开放；syslog 端口若被 `rsyslog` 占用（`netstat -lnup | grep 5514`）就换一个，HFish 通知配置里同步改。
@@ -100,6 +102,7 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 | hfish.auto_block_level | 空 | 达此等级自动封禁：`all`（收到就封）/`low`/`mid`/`high`/`critical`，空=不自动封 |
 | hfish.auto_block_max_per_min | 120 | 自动封禁熔断：每分钟最多封多少个，超出只记事件；0=不限 |
 | hfish.max_blocks | 20000 | 黑名单容量上限，到顶不再新增；0=不限 |
+| hfish.scan_fanout | 5 | 扫描类告警：同源命中多少个**不同端口**才算扫描者并封禁；0=每条都封 |
 | hfish.api_base / api_key / verify_tls | 空 / 空 / false | HFish 开放 API（只读情报），默认自签证书 |
 | hfish.webhook_token | 空 | `/api/hfish/webhook` 的校验串，空则用主 token |
 

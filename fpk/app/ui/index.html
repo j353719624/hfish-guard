@@ -2127,7 +2127,10 @@ select.input{background-color:rgba(3,12,24,.72)}
                   <input class="input mono" id="cfgHfishWtok" autocomplete="off" placeholder="留空则用上方主凭证">
                   <div class="hint">HFish「webhook → 自定义」URL 末尾的 <code>?k=</code></div></div>
               </div>
-              <div class="form-grid mt-16" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+              <div class="form-grid form-grid--3 mt-16">
+                <div class="field"><label class="field-label" for="cfgScanFanout">扫描判定扇出</label>
+                  <input class="input mono" id="cfgScanFanout" type="number" min="0" max="64">
+                  <div class="hint">同一源命中多少个<b>不同端口</b>才算扫描者并封禁；0=每条 scan 告警都封</div></div>
                 <div class="field"><label class="field-label" for="cfgBlockRate">自动封禁熔断（个/分钟）</label>
                   <input class="input mono" id="cfgBlockRate" type="number" min="0" max="10000">
                   <div class="hint">超过后只记录不封禁，防误配导致告警洪水把黑名单刷爆；0=不限</div></div>
@@ -2475,7 +2478,8 @@ function fillConfig(){
   if($('#cfgHfishEnabled'))$('#cfgHfishEnabled').value=hf.enabled?'1':'0';
   if($('#cfgHfishSyslog'))$('#cfgHfishSyslog').value=hf.syslog_port||5514;
   if($('#cfgHfishLevel'))$('#cfgHfishLevel').value=hf.auto_block_level||'';
-  if($('#cfgBlockRate'))$('#cfgBlockRate').value=(typeof hf.auto_block_max_per_min==='number')?hf.auto_block_max_per_min:120;
+  if($('#cfgBlockRate'))$('#cfgBlockRate').value=(typeof hf.auto_block_max_per_min==='number')?hf.auto_block_max_per_min:60;
+  if($('#cfgScanFanout'))$('#cfgScanFanout').value=(typeof hf.scan_fanout==='number')?hf.scan_fanout:5;
   if($('#cfgMaxBlocks'))$('#cfgMaxBlocks').value=(typeof hf.max_blocks==='number')?hf.max_blocks:20000;
   if($('#cfgHfishApi'))$('#cfgHfishApi').value=hf.api_base||'';
   if($('#cfgHfishKey'))$('#cfgHfishKey').value=hf.api_key||'';
@@ -3133,6 +3137,7 @@ $('#cfgForm').addEventListener('submit',function(e){
     syslog_port:Number($('#cfgHfishSyslog').value)||5514,
     auto_block_level:$('#cfgHfishLevel').value,
     auto_block_max_per_min:Math.max(0,Number($('#cfgBlockRate').value)||0),
+    scan_fanout:Math.max(0,Number($('#cfgScanFanout').value)||0),
     max_blocks:Math.max(0,Number($('#cfgMaxBlocks').value)||0),
     api_base:$('#cfgHfishApi').value.trim(),
     api_key:$('#cfgHfishKey').value.trim(),

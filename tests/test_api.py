@@ -380,7 +380,8 @@ class HfishIngestTest(ApiBase):
         self.assertEqual(before, after, "同一 (IP, 类型, 蜜罐) 60s 内应去重")
 
     def test_03_webhook_ingest(self):
-        body = {"src_ip": "198.51.100.9", "attack_type": "scan", "class": "Redis",
+        # 源用真公网段：扫描类告警按「源地址是否公网」过滤，保留段会被当噪声丢
+        body = {"src_ip": "45.33.32.90", "attack_type": "scan", "class": "Redis",
                 "threat_level": "low", "scan_port": 6379}
         r = urllib.request.Request(self.base + "/api/hfish/webhook?k=wh-secret",
                                    data=json.dumps(body).encode(), method="POST",
@@ -389,10 +390,10 @@ class HfishIngestTest(ApiBase):
             res = json.loads(resp.read().decode())
         self.assertEqual(res["accepted"], 1)
         rows = self.call("GET", "/api/events?limit=50")
-        ip = [x for x in rows if x["ip"] == "198.51.100.9"]
+        ip = [x for x in rows if x["ip"] == "45.33.32.90"]
         self.assertTrue(ip)
         # low 级不自动封禁
-        self.assertNotIn("198.51.100.9", [b["ip"] for b in self.call("GET", "/api/blacklist")])
+        self.assertNotIn("45.33.32.90", [b["ip"] for b in self.call("GET", "/api/blacklist")])
 
     def test_04_webhook_bad_token(self):
         req = urllib.request.Request(self.base + "/api/hfish/webhook?k=wrong",
@@ -435,10 +436,11 @@ class HfishIngestTest(ApiBase):
         self.assertTrue(bound.get("tcp"), "新端口未绑定 TCP")
 
         type(self).syslog_port = new_port      # 后续 syslog() 打到新端口
-        self.syslog({"src_ip": "192.0.2.77", "attack_type": "scan", "class": "Redis",
+        # 源用真公网段：扫描类告警按「源地址是否公网」过滤，保留段会被当噪声丢
+        self.syslog({"src_ip": "45.33.32.77", "attack_type": "scan", "class": "Redis",
                      "threat_level": "low"})
         rows = self.call("GET", "/api/events?limit=100")
-        self.assertIn("192.0.2.77", [r["ip"] for r in rows], "重绑后新端口收不到告警")
+        self.assertIn("45.33.32.77", [r["ip"] for r in rows], "重绑后新端口收不到告警")
 
     def test_08_disable_stops_receiver(self):
         self.call("PUT", "/api/config", {"hfish": {"enabled": False}})
@@ -828,9 +830,9 @@ class AutoBlockTest(ApiBase):
             self.proc.kill()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def alert(self, ip, level="other"):
-        body = {"src_ip": ip, "attack_type": "attack", "threat_level": level,
-                "dst_port": 6379, "pot": "数据库服务", "info": "unit-test"}
+    def alert(self, ip, level="other", port=6379, atype="attack", pot="数据库服务"):
+        body = {"src_ip": ip, "attack_type": atype, "threat_level": level,
+                "dst_port": port, "pot": pot, "info": "unit-test"}
         r = urllib.request.Request(self.base + "/api/hfish/webhook?k=wh-secret",
                                    data=json.dumps(body).encode(), method="POST",
                                    headers={"Content-Type": "application/json"})
@@ -862,6 +864,37 @@ class AutoBlockTest(ApiBase):
         rows = [e for e in self.call("GET", "/api/events?limit=50")
                 if e["ip"].startswith("198.51.100.")]
         self.assertEqual(len(rows), 5, "被熔断的告警仍要落事件")
+
+    def test_05_scan_fanout_blocks_after_threshold(self):
+        """公网源扫够多个不同端口 → 判为扫描者，封禁一次。"""
+        self.call("PUT", "/api/config",
+                  {"hfish": {"auto_block_level": "all", "scan_fanout": 3}})
+        for port in (445, 22, 3389):
+            self.alert("45.33.32.156", level="low", port=port, atype="scan", pot="扫描")
+        self.assertIn("45.33.32.156", self.blocked())
+
+    def test_06_scan_below_threshold_not_blocked(self):
+        """扇出不够时不封（只记事件），避免单端口高频被误判。"""
+        self.call("PUT", "/api/config",
+                  {"hfish": {"auto_block_level": "all", "scan_fanout": 5}})
+        for port in (445, 22):
+            self.alert("45.33.32.157", level="low", port=port, atype="scan", pot="扫描")
+        self.assertNotIn("45.33.32.157", self.blocked())
+        rows = [e for e in self.call("GET", "/api/events?limit=50") if e["ip"] == "45.33.32.157"]
+        self.assertTrue(rows, "未达阈值也要留事件")
+
+    def test_07_private_source_scan_is_noise(self):
+        """内网源（同网段 IPv6/广播）算噪声：丢弃，不写事件、不封。"""
+        body = {"src_ip": "192.168.110.50", "attack_type": "scan",
+                "scan_port": 63219, "threat_level": "low"}
+        r = urllib.request.Request(self.base + "/api/hfish/webhook?k=wh-secret",
+                                   data=json.dumps(body).encode(), method="POST",
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            res = json.loads(resp.read().decode())
+        self.assertEqual(res.get("accepted", 0), 0, "内网源的扫描告警应被当噪声丢弃")
+        rows = [e for e in self.call("GET", "/api/events?limit=50") if e["ip"] == "192.168.110.50"]
+        self.assertEqual(rows, [], "噪声不应进事件表")
 
     def test_04_max_blocks_cap(self):
         """容量上限：到顶后不再新增，避免 ipset/DB 无界增长。"""

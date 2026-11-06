@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.4"
+VERSION = "1.5.0"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -108,7 +108,8 @@ DEFAULT_CONFIG = {
         "verify_tls": False,            # HFish 默认自签证书，保持 False
         "webhook_token": "",            # 自定义 webhook 的校验串；空则要求主 token
         "auto_block_level": "",         # "" 不自动封禁；low/mid/high/critical 按等级门禁；all=任何等级都封
-        "auto_block_max_per_min": 120,  # 自动封禁熔断：每分钟最多封多少个（防告警洪水把黑名单刷爆）
+        "auto_block_max_per_min": 60,   # 自动封禁熔断：每分钟最多封多少个（防告警洪水把黑名单刷爆）
+        "scan_fanout": 5,              # 扫描类告警：同源命中多少个不同端口才算扫描者（0=按条直接封）
         "max_blocks": 20000,            # 黑名单容量上限，超了不新增
     },
 }
@@ -190,6 +191,42 @@ def _truthy(val, default=False):
     if isinstance(val, (int, float)):
         return bool(val)
     return str(val).strip().lower() in ("1", "true", "yes", "on", "enable", "enabled")
+
+
+# 非公网网段清单（自己列，不依赖 stdlib 的 is_private/is_global）：
+# ipaddress 的判断随 Python 版本变（3.13 把 203.0.113.0/24 算私有，3.9 不算），
+# 同一份代码在开发机和 NAS 上会得出相反结论，必须固定下来。
+# 100.64.0.0/10（CGNAT）刻意不列入：那是真实运营商出口，攻击源不少。
+_SPECIAL_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+    "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+    "224.0.0.0/4", "240.0.0.0/4",
+    "::1/128", "fc00::/7", "fe80::/10", "ff00::/8", "2001:db8::/32",
+))
+
+
+def _is_public_ip(ip):
+    """是否为公网可路由地址。
+
+    家里 HFish 的扫描感知会把同网段 IPv6 的 mDNS/SSDP/BitTorrent 广播也判成
+    「扫描」，真机上一小时能推 12 万条。按目标端口过滤挡不住它们——广播照样
+    打蜜罐端口——只能按源地址判断：非公网源一律当噪声丢。
+
+    公网源则要保留：ECS 上真正打进来的就是公网扫描器（真机 249 个源，
+    其中一个扫了 207 个端口），把它们当噪声丢掉就等于放弃了防护。
+    """
+    try:
+        addr = ipaddress.ip_address(str(ip or "").strip())
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    for net in _SPECIAL_NETS:
+        if addr.version == net.version and addr in net:
+            return False
+    return True
 
 
 def _is_v6(addr):
@@ -933,7 +970,7 @@ def normalize_hfish(raw):
                     base[k] = "all"
                 else:
                     base[k] = lv if lv in ("low", "mid", "high", "critical") else ""
-            elif k in ("auto_block_max_per_min", "max_blocks"):
+            elif k in ("auto_block_max_per_min", "max_blocks", "scan_fanout"):
                 try:
                     num = int(v)
                     if num >= 0:
@@ -1141,6 +1178,7 @@ class Ingest:
         self.last_bad_log = 0.0
         self.last_raw = ""          # 最近一条解析失败的原始报文（排查格式用）
         self.block_win = []         # 最近一分钟的自动封禁时间戳（熔断用）
+        self.scan_state = {}        # ip -> {ports:set, first:ts, n:int} 扫描类按源聚合
         self.tripped_at = 0.0       # 上次触发熔断的时间（日志去抖）
 
     def push(self, payload, via="syslog"):
@@ -1160,24 +1198,24 @@ class Ingest:
         cfg = self.store.cfg
         # 扫描感知的噪声：HFish 把「扫描感知」传感器端口上的广播/组播也算成 scan 告警，
         # 真机上 11 万条里绝大多数是同网段 IPv6 的 mDNS/SSDP/BT 流量，不是打蜜罐的。
-        # 判定：attack_type=scan 且目标端口不在我们监视的蜜罐端口列表里 → 丢弃。
-        if data.get("attack_type") == "scan":
-            try:
-                watched = set(int(p) for p in cfg.get("ports", []))
-            except (TypeError, ValueError):
-                watched = set()
-            if data.get("port") and int(data["port"]) not in watched:
-                with self.lock:
-                    self.counts["skipped"] += 1
-                    self.counts["noise"] = self.counts.get("noise", 0) + 1
-                return None
+        # 判定改看**源地址**：非公网源（内网/链路本地/组播）一律当噪声丢。
+        # 原来按「目标端口是否在监视列表」过滤，挡不住广播——广播照样打蜜罐端口，
+        # 而且会把 ECS 上打 445/11000/3030 等端口的真实扫描器一并丢掉。
+        if (data.get("attack_type") or "").lower() == "scan" and not _is_public_ip(ip):
+            with self.lock:
+                self.counts["skipped"] += 1
+                self.counts["noise"] = self.counts.get("noise", 0) + 1
+            return None
         if ip in Whitelist(cfg.get("whitelist", [])):
             with self.lock:
                 self.counts["skipped"] += 1
             return None
+        now = time.time()
+        # 扫描类按源聚合：一条告警 = 一个端口，聚合后才好判断「这源是不是扫描器」
+        if (data.get("attack_type") or "").lower() == "scan":
+            return self._handle_scan(ip, data, now, via)
         # 同一 (IP, 攻击类型, 蜜罐) 60s 内只记一条，挡住告警洪水
         key = (ip, data.get("attack_type"), data.get("pot"))
-        now = time.time()
         with self.lock:
             if now - self.seen.get(key, 0) < 60:
                 self.counts["skipped"] += 1
@@ -1222,6 +1260,72 @@ class Ingest:
         return {"ip": ip, "action": action, "detail": detail}
 
 
+    def _handle_scan(self, ip, data, now, via="syslog"):
+        """扫描类告警按源聚合处理。
+
+        一个专业扫描器一小时能打 200 多个端口（真机：204.76.203.212 扫了 207 个）。
+        按告警条数封禁有两个问题：事件表被刷爆、同一 IP 的 TTL 被反复刷新。
+        所以聚合成「每源每 10 分钟一条汇总事件」，只有当该源命中的**不同端口数**
+        达到 scan_fanout 才判定为扫描者并封一次。
+
+        返回 {"ip":..., "action":..., "detail":...}（与 push 一致）。
+        """
+        hf = self.store.cfg.get("hfish", {})
+        try:
+            need = int(hf.get("scan_fanout", 5))
+        except (TypeError, ValueError):
+            need = 5
+        port = int(data.get("port") or 0)
+        with self.lock:
+            if via in self.counts:
+                self.counts[via] += 1
+            self.counts["last"] = int(now)
+            st = self.scan_state.get(ip)
+            fresh = st is None or now - st["first"] > 600
+            if fresh:
+                st = {"ports": set(), "first": now, "n": 0}
+                self.scan_state[ip] = st
+            st["ports"].add(port)
+            st["n"] += 1
+            hit = len(st["ports"])
+            if len(self.scan_state) > 5000:
+                self.scan_state = {k: v for k, v in self.scan_state.items()
+                                   if now - v["first"] < 600}
+
+        detail_ports = ",".join(str(p) for p in sorted(st["ports"])[:12])
+        detail = " · ".join(x for x in (
+            "类型 scan",
+            "蜜罐 " + data["pot"] if data.get("pot") else "",
+            "命中 %d 个端口%s" % (hit, ("（" + detail_ports + "）") if detail_ports else ""),
+            "来源 " + via) if x)
+
+        action = "扫描探测（%d/%d 端口）" % (hit, need if need > 0 else hit)
+        blocked = False
+        if need > 0 and hit >= need:
+            gate = str(hf.get("auto_block_level") or "").strip().lower()
+            level = data.get("level") or ""
+            gate_open = bool(gate) and (gate in BLOCK_ALL or
+                                        LEVEL_RANK.get(level, 0) >= LEVEL_RANK.get(gate, 99))
+            if gate_open and self.store.cfg.get("mode") == "enforce":
+                verdict = self._try_autoblock(ip, data, "HFish 端口扫描（命中 %d 个端口）" % hit)
+                if verdict is True:
+                    blocked = True
+                    with self.lock:
+                        self.scan_state.pop(ip, None)
+                    action = "自动封禁（端口扫描 · %d 个端口）" % hit
+                    log("HFish 端口扫描，封禁 %s（命中 %d 个端口）" % (ip, hit), "warn")
+                elif verdict is None:
+                    action = "自动封禁（已达上限，跳过）"
+                else:
+                    action = "扫描探测（熔断中，仅记录）"
+            else:
+                action = "扫描探测（%d 个端口，未达封禁门禁）" % hit
+
+        # 每个源每 10 分钟只留一条汇总事件，避免事件表被扫端口的洪水刷爆
+        if fresh or blocked:
+            self.store.event(ip, port, hit, "hfish", action, detail)
+        return {"ip": ip, "action": action, "detail": detail}
+
     def _try_autoblock(self, ip, data, reason):
         """真正下发封禁。True=封了；False=熔断；None=黑名单已满。
 
@@ -1241,7 +1345,7 @@ class Ingest:
             return None
 
         try:
-            rate = int(hf.get("auto_block_max_per_min", 120))
+            rate = int(hf.get("auto_block_max_per_min", 60))
         except (TypeError, ValueError):
             rate = 120
         now = time.time()
@@ -2109,8 +2213,9 @@ def hfish_link():
         "last_pull": int(api.last_pull) if api else 0,
         "intel_count": len(api.intel) if api else 0,
         "auto_block_level": hf.get("auto_block_level") or "",
-        "auto_block_max_per_min": hf.get("auto_block_max_per_min", 120),
+        "auto_block_max_per_min": hf.get("auto_block_max_per_min", 60),
         "max_blocks": hf.get("max_blocks", 20000),
+        "scan_fanout": hf.get("scan_fanout", 5),
         "received": dict(ing.counts) if ing else {},
     }
 
