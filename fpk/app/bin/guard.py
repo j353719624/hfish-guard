@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -107,7 +107,9 @@ DEFAULT_CONFIG = {
         "api_key": "",                  # HFish「系统设置 → API 配置」里生成的 key
         "verify_tls": False,            # HFish 默认自签证书，保持 False
         "webhook_token": "",            # 自定义 webhook 的校验串；空则要求主 token
-        "auto_block_level": "",         # "" 不自动封禁；high / critical 时按告警等级直接封禁
+        "auto_block_level": "",         # "" 不自动封禁；low/mid/high/critical 按等级门禁；all=任何等级都封
+        "auto_block_max_per_min": 120,  # 自动封禁熔断：每分钟最多封多少个（防告警洪水把黑名单刷爆）
+        "max_blocks": 20000,            # 黑名单容量上限，超了不新增
     },
 }
 
@@ -845,6 +847,11 @@ class Store:
             with self.db:
                 self.db.execute("UPDATE blocks SET active=0 WHERE ip=?", (ip,))
 
+    def active_block_count(self):
+        with self.lock:
+            row = self.db.execute("SELECT COUNT(*) FROM blocks WHERE active=1").fetchone()
+            return row[0] if row else 0
+
     def active_blocks(self):
         with self.lock:
             return self.db.execute(
@@ -894,8 +901,14 @@ def normalize_whitelist(raw):
     return out
 
 
+# HFish 对蜜罐命中给的等级是 "other"（它不给 high/mid）。真机上 14 条蜜罐告警
+# 全是 other，若不给它秩，任何等级门禁都命中不了 —— 自动封禁等于没开。
 LEVEL_RANK = {"": 0, "low": 1, "mid": 2, "medium": 2, "high": 3, "critical": 4,
+              "other": 1, "unknown": 1, "info": 1, "warning": 2,
               "低": 1, "中": 2, "高": 3, "严重": 4}
+
+# 「不挑等级，收到的都封」的几种写法
+BLOCK_ALL = ("all", "any", "*", "全部", "任何")
 
 
 def normalize_hfish(raw):
@@ -916,7 +929,17 @@ def normalize_hfish(raw):
                     pass
             elif k == "auto_block_level":
                 lv = str(v or "").strip().lower()
-                base[k] = lv if lv in ("low", "mid", "medium", "high", "critical") else ""
+                if lv in BLOCK_ALL:
+                    base[k] = "all"
+                else:
+                    base[k] = lv if lv in ("low", "mid", "high", "critical") else ""
+            elif k in ("auto_block_max_per_min", "max_blocks"):
+                try:
+                    num = int(v)
+                    if num >= 0:
+                        base[k] = num
+                except (TypeError, ValueError):
+                    pass
             else:
                 base[k] = str(v or "").strip()
     return base
@@ -1117,6 +1140,8 @@ class Ingest:
         self.counts = {"syslog": 0, "webhook": 0, "skipped": 0, "last": 0}
         self.last_bad_log = 0.0
         self.last_raw = ""          # 最近一条解析失败的原始报文（排查格式用）
+        self.block_win = []         # 最近一分钟的自动封禁时间戳（熔断用）
+        self.tripped_at = 0.0       # 上次触发熔断的时间（日志去抖）
 
     def push(self, payload, via="syslog"):
         data = parse_hfish_payload(payload)
@@ -1165,16 +1190,27 @@ class Ingest:
             self.counts["last"] = int(now)
 
         hf = cfg.get("hfish", {})
-        need = hf.get("auto_block_level") or ""
+        need = str(hf.get("auto_block_level") or "").strip().lower()
         level = data.get("level") or ""
         action = "蜜罐告警"
-        if need and LEVEL_RANK.get(level, 0) >= LEVEL_RANK.get(need, 99) and cfg.get("mode") == "enforce":
-            self.monitor.kernel.add_black(ip)
-            self.store.add_block(ip, data.get("port") or 0, data.get("count") or 0,
-                                 cfg.get("ttl", 3600), "HFish %s 级告警" % (level or "high"))
-            self.monitor.forget(ip)
-            action = "自动封禁（HFish 告警）"
-            log("HFish 高危告警，封禁 %s（%s / %s）" % (ip, data.get("attack_type"), data.get("pot")), "warn")
+        block_all = need in BLOCK_ALL
+        # 门禁：all=任何等级（含未标等级）都封；否则按等级秩比较
+        gate_open = bool(need) and (block_all or
+                                    LEVEL_RANK.get(level, 0) >= LEVEL_RANK.get(need, 99))
+        if gate_open and cfg.get("mode") == "enforce":
+            if block_all:
+                reason = "HFish %s 告警（不挑等级）" % (level or "未标")
+            else:
+                reason = "HFish %s 级告警" % (level or "high")
+            verdict = self._try_autoblock(ip, data, reason)
+            if verdict is True:
+                action = "自动封禁（HFish 告警）"
+                log("HFish 告警，封禁 %s（%s / %s / %s）"
+                    % (ip, data.get("attack_type"), data.get("pot"), level or "未标"), "warn")
+            elif verdict is None:
+                action = "自动封禁（已达上限，跳过）"
+            else:
+                action = "蜜罐告警（熔断中，仅记录）"
 
         detail = " · ".join(x for x in (
             ("类型 " + data["attack_type"]) if data.get("attack_type") else "",
@@ -1184,6 +1220,44 @@ class Ingest:
             ("来源 " + via)) if x)
         self.store.event(ip, data.get("port") or 0, data.get("count") or 0, "hfish", action, detail)
         return {"ip": ip, "action": action, "detail": detail}
+
+
+    def _try_autoblock(self, ip, data, reason):
+        """真正下发封禁。True=封了；False=熔断；None=黑名单已满。
+
+        两道保护是必须的：HFish 侧只要有人误勾一次「扫描」类型，或者情报源抽风，
+        告警就会成百上千条涌进来；无节制封禁会把这些 IP 一次性钉死在 ipset 里，
+        里面很可能混着自家邻居、运营商探针、爬虫。宁可少封，不可封爆。
+        """
+        hf = self.store.cfg.get("hfish", {})
+        try:
+            cap = int(hf.get("max_blocks", 20000))
+        except (TypeError, ValueError):
+            cap = 20000
+        if cap > 0 and self.store.active_block_count() >= cap:
+            if time.time() - self.tripped_at > 300:
+                self.tripped_at = time.time()
+                log("黑名单已达上限 %d，跳过封禁 %s" % (cap, ip), "warn")
+            return None
+
+        try:
+            rate = int(hf.get("auto_block_max_per_min", 120))
+        except (TypeError, ValueError):
+            rate = 120
+        now = time.time()
+        self.block_win = [t for t in self.block_win if now - t < 60]
+        if rate > 0 and len(self.block_win) >= rate:
+            if now - self.tripped_at > 300:
+                self.tripped_at = now
+                log("自动封禁已到速率上限 %d/分钟，后续告警只记录不再封禁" % rate, "warn")
+            return False
+
+        self.monitor.kernel.add_black(ip)
+        self.store.add_block(ip, data.get("port") or 0, data.get("count") or 0,
+                             self.store.cfg.get("ttl", 3600), reason)
+        self.monitor.forget(ip)
+        self.block_win.append(now)
+        return True
 
 
 class SyslogReceiver(threading.Thread):
@@ -1807,7 +1881,7 @@ class Handler(BaseHTTPRequestHandler):
                                   verdict=first("filter", "all") or "all",
                                   q=first("q"), offset=first("offset", 0) or 0))
             elif path == "/api/blacklist":
-                self._json(blacklist())
+                self._json(blacklist(limit=first("limit", 500) or 500))
             elif path == "/api/whitelist":
                 self._json(STORE.cfg.get("whitelist", []))
             elif path == "/api/config":
@@ -2035,6 +2109,8 @@ def hfish_link():
         "last_pull": int(api.last_pull) if api else 0,
         "intel_count": len(api.intel) if api else 0,
         "auto_block_level": hf.get("auto_block_level") or "",
+        "auto_block_max_per_min": hf.get("auto_block_max_per_min", 120),
+        "max_blocks": hf.get("max_blocks", 20000),
         "received": dict(ing.counts) if ing else {},
     }
 
@@ -2088,7 +2164,7 @@ def status():
         "scan_block": bool(cfg.get("scan_block", True)),
         "ports": cfg["ports"],
         "whitelist": cfg["whitelist"],
-        "blacklist_count": len(STORE.active_blocks()),
+        "blacklist_count": STORE.active_block_count(),
         "events_count": STORE.events_count("over"),
         "trap": MONITOR.kernel.trap_present([str(p) for p in cfg["ports"]]),
         "kernel": dict({"kind": MONITOR.kernel.kind,
@@ -2148,10 +2224,14 @@ def events(limit=500, verdict=None, q=None, offset=0):
     } for r in items]
 
 
-def blacklist():
+def blacklist(limit=500):
+    """按封禁时间倒序返回前 limit 条。自动封禁开启后条数可能上千，
+    全量返回会把 UI 和带宽拖死（每条还要做一次归属地查询）。"""
     now = int(time.time())
     out = []
     for ip, ts, expire, port, packets, ttl, reason in STORE.active_blocks():
+        if len(out) >= max(1, int(limit or 500)):
+            break
         out.append({
             "ip": ip,
             "at": ts * 1000,

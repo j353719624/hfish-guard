@@ -43,8 +43,15 @@ def free_dual_port():
     （实测：UDP 挑中的号可能正是守护进程自己正在用的 TCP 端口，
     结果 UDP 绑上、TCP EADDRINUSE，表现为 syslog_bound={"udp":true,"tcp":false}）。
     """
-    for _ in range(60):
-        port = free_port()
+    for _ in range(200):
+        # 起点必须也是 0.0.0.0 上取到的：只绑 127.0.0.1:0 可能拿到一个
+        # 仍被别的进程以 0.0.0.0 占着的号（Windows 实测偶发）
+        seed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            seed.bind(("0.0.0.0", 0))
+            port = seed.getsockname()[1]
+        finally:
+            seed.close()
         ok = True
         for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
             probe = socket.socket(socket.AF_INET, kind)
@@ -774,6 +781,95 @@ class HfishPayloadTest(unittest.TestCase):
         d = self.g.parse_hfish_payload(
             "<134>Nov  6 08:12:44 fnOS HFish[942440]: client: n1, src_ip: 198.51.100.9")
         self.assertEqual(d["ip"], "198.51.100.9")
+
+
+class AutoBlockTest(ApiBase):
+    """HFish 告警自动封禁：等级门禁（other）、速率熔断、容量上限。
+
+    三个用例互相会污染黑名单与熔断窗口，所以每个用例各起一个干净实例。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hfish-guard-ab-")
+        self.port = free_port()
+        self.syslog_port = free_dual_port()
+        type(self).base = "http://127.0.0.1:%d" % self.port
+        type(self).token = "hg-test-token-ab"
+        cfg = {
+            "mode": "enforce", "threshold": 9999, "window": 60, "poll": 1, "ttl": 600,
+            "token": self.token, "ports": [6379], "whitelist": [{"cidr": "10.9.0.0/16"}],
+            "hfish": {"enabled": True, "syslog_port": self.syslog_port,
+                      "webhook_token": "wh-secret", "auto_block_level": "all",
+                      "auto_block_max_per_min": 120, "max_blocks": 20000},
+        }
+        with open(os.path.join(self.tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        env = dict(os.environ)
+        env.update({"HFISH_GUARD_FAKE": "1", "HFISH_GUARD_SIM": "0"})
+        self.proc = subprocess.Popen(
+            [sys.executable, GUARD, "--fake", "--port", str(self.port), "--data", self.tmp],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                st = self.call("GET", "/api/status")
+                if st.get("link", {}).get("hfish", {}).get("syslog_bound", {}).get("udp"):
+                    return
+            except Exception:                                  # noqa: BLE001
+                pass
+            time.sleep(0.3)
+        raise RuntimeError("自动封禁用例实例未就绪")
+
+    def tearDown(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def alert(self, ip, level="other"):
+        body = {"src_ip": ip, "attack_type": "attack", "threat_level": level,
+                "dst_port": 6379, "pot": "数据库服务", "info": "unit-test"}
+        r = urllib.request.Request(self.base + "/api/hfish/webhook?k=wh-secret",
+                                   data=json.dumps(body).encode(), method="POST",
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+
+    def blocked(self):
+        return [b["ip"] for b in self.call("GET", "/api/blacklist?limit=1000")]
+
+    def test_01_other_level_blocks_with_all(self):
+        """HFish 蜜罐告警等级是 other，选「全部等级」必须真的封。"""
+        self.alert("203.0.113.21")
+        self.assertIn("203.0.113.21", self.blocked())
+
+    def test_02_high_gate_ignores_other(self):
+        """等级门禁仍要有效：设 high 时 other 级告警只记录不封。"""
+        self.call("PUT", "/api/config", {"hfish": {"auto_block_level": "high"}})
+        self.alert("203.0.113.22")
+        self.assertNotIn("203.0.113.22", self.blocked())
+        rows = [e for e in self.call("GET", "/api/events?limit=50") if e["ip"] == "203.0.113.22"]
+        self.assertTrue(rows, "至少要有事件记录")
+
+    def test_03_rate_limit_trips(self):
+        """熔断：每分钟只允许封 N 个，超出的只记录，防告警洪水刷爆黑名单。"""
+        self.call("PUT", "/api/config", {"hfish": {"auto_block_max_per_min": 2}})
+        for i in range(5):
+            self.alert("198.51.100.%d" % (30 + i))
+        self.assertEqual(len(self.blocked()), 2, "到达速率上限后不应继续封禁")
+        rows = [e for e in self.call("GET", "/api/events?limit=50")
+                if e["ip"].startswith("198.51.100.")]
+        self.assertEqual(len(rows), 5, "被熔断的告警仍要落事件")
+
+    def test_04_max_blocks_cap(self):
+        """容量上限：到顶后不再新增，避免 ipset/DB 无界增长。"""
+        self.call("PUT", "/api/config",
+                  {"hfish": {"auto_block_max_per_min": 0, "max_blocks": 1}})
+        for i in range(3):
+            self.alert("198.51.100.%d" % (60 + i))
+        self.assertEqual(len(self.blocked()), 1, "超过容量上限不应再封")
 
 
 if __name__ == "__main__":

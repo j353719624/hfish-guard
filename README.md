@@ -51,7 +51,9 @@
 
 syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type` / `class` / `account` / `threat_level` / `threat_name` / `labels` / `geo` / `client` / `time` / `info`），且**容错**：JSON、`key: value`、`key=value`、只有一行带 IP 的纯文本都能吃；节点离线这类系统告警没有 `src_ip`，只计入 `skipped`，不会当成攻击。
 
-配了 `auto_block_level`（`low`/`mid`/`high`/`critical`）后，等级达到且模式为 `enforce` 时**直接封禁**并记 `verdict=hfish` 事件；否则只记录。三个闸门：必须 enforce、必须达等级、同 `(IP, 攻击类型, 蜜罐)` 60 秒内只处理一次（挡告警洪水）。白名单 IP 在入口即丢弃。
+配了 `auto_block_level` 后，等级达到且模式为 `enforce` 时**直接封禁**并记 `verdict=hfish` 事件；否则只记录。闸门：必须 enforce、必须达等级、同 `(IP, 攻击类型, 蜜罐)` 60 秒内只处理一次（挡告警洪水）、每分钟封禁数不超 `auto_block_max_per_min`、黑名单不超 `max_blocks`。白名单 IP 在入口即丢弃。
+
+**要“收到就封”必须选 `all`**：HFish 对蜜罐命中给的等级是 `other`，不是 `high`/`mid`。只配 `high` 的话，真机上一条都不会封（实测 14 条蜜罐告警全是 `other`）。`all` 表示不挑等级（含未标等级），配合熔断与容量上限使用。
 
 联通状态在 `/api/status` 的 `link.hfish` 字段：`syslog_bound`（`{"udp":true,"tcp":true}`）、`received`（`{"syslog":N,"webhook":N,"skipped":N}`）、`api_ok` / `api_error` / `intel_count`。**改 syslog 端口或开关联动都即时生效**（接收器按配置重绑，不用重启进程）。
 
@@ -95,7 +97,9 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 | whitelist | 空 | 永不计数、永不封禁的 IP / CIDR（内核侧豁免） |
 | hfish.enabled | false | 是否接收 HFish 告警（syslog / webhook） |
 | hfish.syslog_port | 5514 | syslog 监听端口，UDP + TCP 同时绑定 |
-| hfish.auto_block_level | 空 | 达此等级自动封禁：`low`/`mid`/`high`/`critical`，空=不自动封 |
+| hfish.auto_block_level | 空 | 达此等级自动封禁：`all`（收到就封）/`low`/`mid`/`high`/`critical`，空=不自动封 |
+| hfish.auto_block_max_per_min | 120 | 自动封禁熔断：每分钟最多封多少个，超出只记事件；0=不限 |
+| hfish.max_blocks | 20000 | 黑名单容量上限，到顶不再新增；0=不限 |
 | hfish.api_base / api_key / verify_tls | 空 / 空 / false | HFish 开放 API（只读情报），默认自签证书 |
 | hfish.webhook_token | 空 | `/api/hfish/webhook` 的校验串，空则用主 token |
 

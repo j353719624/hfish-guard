@@ -253,7 +253,24 @@ guard 配置：
 
 ### 7.5 按等级自动封禁
 
-配了 `auto_block_level`（`low`/`mid`/`high`/`critical`）后，HFish 推来的告警只要**等级 ≥ 阈值**且 `mode=enforce`，就直接封禁并记 `verdict=hfish` 的事件；否则只记录。
+配了 `auto_block_level` 后，HFish 推来的告警只要**等级 ≥ 阈值**且 `mode=enforce`，就直接封禁并记 `verdict=hfish` 的事件；否则只记录。
+
+### 为什么「收到就封」要写 `all`，而不是 `high`
+
+HFish 对**蜜罐命中**给出的 `threat_level` 是 `other` —— 它不给 high/mid。真机上 14 条蜜罐告警等级全是 `other`，而 `LEVEL_RANK` 里原本没有 `other`，`LEVEL_RANK.get("other", 0)` 得 0，任何等级门禁都命中不了。所以「按 high 及以上自动封禁」在真机上等于没开：配置看着对，一条都不会封。
+
+现在把 `other`/`unknown`/`info` 归到秩 1（等同 low），并提供 `all` 关键字（也接受 `any`/`*`/`全部`）表示不挑等级。ECS 蜜罐场景就是配 `all`：凡是打进来的源 IP 一律进黑名单，等家里真做了端口映射，这些 IP 已经被拦在门外。
+
+### 两道熔断（必须有）
+
+「不挑等级」意味着把封禁权交给上游。上游只要误勾一次「扫描类型」、或者情报源抽风，告警就是成百上千条/秒，无节制封禁会把这些 IP 一次性钉死在 ipset 里 —— 里面很可能混着自家邻居、运营商探针、爬虫，而且窗口短到没人来得及反应。
+
+| 保护 | 默认 | 行为 |
+|---|---|---|
+| `auto_block_max_per_min` | 120 | 一分钟内超出后，告警照常落事件、`action` 标「熔断中，仅记录」，不再封禁 |
+| `max_blocks` | 20000 | 黑名单到顶后不再新增（TTL 到期自然回落），`action` 标「已达上限，跳过」 |
+
+熔断与上限都只在自动封禁路径生效，手动 `POST /api/blacklist` 不受影响。
 
 ```
 LEVEL_RANK = {"":0, low:1, mid/medium:2, high:3, critical:4, 低:1, 中:2, 高:3, 严重:4}
