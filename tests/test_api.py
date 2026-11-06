@@ -273,6 +273,26 @@ class GuardApiTest(ApiBase):
         self.assertEqual(items["10.1.2.3"]["cc"], "LAN")
         self.assertEqual(items["203.0.113.9"]["source"], "private")
 
+    def test_11b_root_redirects_to_token_url(self):
+        """直接访问 / 或带过期凭证时，应 302 到带当前 token 的地址。
+
+        用户反馈「凭证见应用『配置』页？在哪里」——与其让人满屏找凭证，
+        不如服务端直接把凭证补上（飞牛桌面入口本来就是这么带进去的）。
+        """
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        for path in ("/", "/web", "/web/", "/index.html", "/web/?token=stale-token"):
+            try:
+                resp = opener.open(self.base + path, timeout=10)
+                code, loc = resp.getcode(), resp.headers.get("Location", "")
+            except urllib.error.HTTPError as e:
+                code, loc = e.code, e.headers.get("Location", "")
+            self.assertEqual(code, 302, "%s 应重定向" % path)
+            self.assertIn("token=%s" % self.token, loc, "%s 重定向应带上当前 token" % path)
+
     def test_11_static_ui(self):
         code, body = self.call("GET", "/", raw=True)
         self.assertEqual(code, 200)

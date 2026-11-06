@@ -35,6 +35,26 @@ if tar -xzOf "$OUT/$APP.fpk" ./app.tgz | tar -tzf - | grep -qE '(__pycache__|\.p
   exit 1
 fi
 
+# 校验：UI 内联脚本必须语法正确
+# 踩过的坑：手工改 HTML 时漏了一个双引号，整个 <script> 挂掉，页面白屏且
+# 没有任何报错（浏览器只说「HG_LIVE is undefined」）。这里用 node --check 拦一道。
+if command -v node >/dev/null 2>&1; then
+  python3 - "$SRC/app/ui/index.html" "$TMP/ui.js" <<'PY'
+import io, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+html = io.open(src, encoding="utf-8").read()
+blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+if not blocks:
+    sys.exit("UI 里没找到内联脚本")
+io.open(dst, "w", encoding="utf-8", newline="\n").write(blocks[0])
+PY
+  if ! node --check "$TMP/ui.js"; then
+    echo "UI 内联脚本语法错误，已中止构建" >&2
+    exit 1
+  fi
+  echo "ui script: syntax ok"
+fi
+
 SIZE=$(stat -c %s "$OUT/$APP.fpk")
 echo "built: $OUT/$APP.fpk (${SIZE} bytes)"
 echo "---- 内容 ----"

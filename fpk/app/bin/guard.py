@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -1968,6 +1968,23 @@ class Handler(BaseHTTPRequestHandler):
         query = query or {}
         first = lambda k, d="": (query.get(k) or [d])[0]      # noqa: E731
         if path in ("/", "/web", "/web/", "/index.html"):
+            # 页面入口没带凭证（或带的是过期凭证）时，直接补上当前 token 重定向。
+            # 飞牛桌面入口本来就是 /web/?token=xxx 这样带进去的，所以这不降低安全性；
+            # 好处是任何入口（浏览器直接输 IP:9705、收藏夹、旧标签页）都能直接进，
+            # 不用再让人去找「凭证在配置页哪里」。
+            want = first("token")
+            tok = (STORE.cfg.get("token") if STORE else "") or ""
+            if tok and want != tok:
+                # 保留其他 query 参数（?demo=1 / ?selftest=1 之类），只换掉 token
+                params = {k: v for k, v in query.items() if k != "token"}
+                params["token"] = [tok]
+                loc = "/web/?" + urllib.parse.urlencode(params, doseq=True)
+                self.send_response(302)
+                self.send_header("Location", loc)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._static("index.html")
             return
         if path == "/favicon.ico":

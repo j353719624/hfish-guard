@@ -127,6 +127,13 @@ select.input{appearance:none;background-image:linear-gradient(45deg,transparent 
 .gate-rule{height:1px;background:linear-gradient(90deg,var(--amber),transparent);margin-bottom:24px}
 .gate-title{font-size:19px;font-weight:500;margin:0 0 6px;letter-spacing:.01em}
 .gate-sub{font-size:12.5px;color:var(--t2);margin:0 0 24px;line-height:1.7}
+/* 演示模式横幅：必须一眼看出是样例数据，不能让人误当真实监控 */
+body[data-demo] .demo-banner{display:flex}
+.demo-banner{display:none;align-items:center;justify-content:center;gap:10px;
+  padding:8px 16px;background:rgba(242,192,120,.13);
+  border-bottom:1px solid rgba(242,192,120,.45);color:#F2C078;
+  font-size:12px;letter-spacing:.4px}
+.demo-banner b{color:#FFD79A}
 .gate-form{display:flex;flex-direction:column;gap:14px}
 .gate-foot{margin-top:22px;padding-top:16px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--t3)}
 .gate-demo{font-family:var(--mono);color:var(--amber);background:var(--amber-soft);padding:3px 8px;border-radius:2px;cursor:pointer;border:1px dashed rgba(232,163,61,.4)}
@@ -1497,7 +1504,7 @@ select.input{background-color:rgba(3,12,24,.72)}
     </div>
     <div class="gate-rule"></div>
     <h1 class="gate-title">接入凭证校验</h1>
-    <p class="gate-sub">控制台与守卫守护进程同机部署。请输入接口 Token 以读取状态、事件与黑白名单，凭证仅保存在本次会话。</p>
+    <p class="gate-sub">控制台与守卫守护进程同机部署。请输入接口 Token 以读取状态、事件与黑白名单，凭证仅保存在本次会话。<br><b>Token 在哪</b>：应用左侧「配置 → 接口鉴权」页（复制按钮旁）；或 NAS 上 <code>/vol2/@appdata/hfish-guard/config.json</code> 的 <code>token</code> 字段。从飞牛桌面图标打开会自动带上凭证，无需手填。</p>
     <form class="gate-form" id="gateForm" novalidate>
       <div class="field">
         <label class="field-label" for="tokenInput">API TOKEN<span class="req">*</span></label>
@@ -1507,13 +1514,14 @@ select.input{background-color:rgba(3,12,24,.72)}
       <button class="btn btn--primary" type="submit" style="width:100%;min-height:38px">进入值守台</button>
     </form>
     <div class="gate-foot">
-      <span>演示凭证 <button type="button" class="gate-demo" id="fillDemo" title="点击填入">hfish-guard-demo</button></span>
+      <button type="button" class="gate-demo" id="hgDemoIn2" title="不连接后端，用内置样例数据看看界面长什么样（数据是假的，不是真实监控）">预览界面（演示数据，非真实监控）</button>
       <span>REST · Token 鉴权</span>
     </div>
   </div>
 </div>
 
 <!-- ===================== 应用 ===================== -->
+<div class="demo-banner" role="status"><b>演示数据</b>　未连接守护进程，本页所有数字与图表均为样例，不是真实监控　<a href="/web/" target="_self" rel="noopener">连接真实数据</a></div>
 <div class="app" id="app" hidden>
   <header class="topbar">
     <div class="topbar-brand">
@@ -2927,7 +2935,7 @@ function copyText(t,okMsg){
 }
 
 /* ---------------- 事件绑定 ---------------- */
-$('#fillDemo').addEventListener('click',function(){$('#tokenInput').value='hfish-guard-demo';$('#tokenInput').focus();});
+$('#hgDemoIn2').addEventListener('click',function(){location.href=location.pathname+'?demo=1';});
 $('#gateForm').addEventListener('submit',function(e){
   e.preventDefault();
   var v=$('#tokenInput').value.trim();
@@ -3533,6 +3541,11 @@ var HG_LIVE=(function(){
 
   /* 顶栏右上角的连接指示（兼作「断开连接」按钮） */
   function badge(){
+    var st=document.querySelector('.topbar-status');
+    if(st&&document.body.getAttribute('data-demo')==='1'){
+      st.innerHTML='<span class="lamp" aria-hidden="true" style="background:#F2C078"></span>'+
+        '<span>演示数据 · 未连接守护进程</span><span class="dim mono">:9705</span>';
+    }
     var tools=document.querySelector('.hd-tools');if(!tools)return;
     var el=document.getElementById('hgLive');
     if(!el){
@@ -3558,8 +3571,11 @@ var HG_LIVE=(function(){
     detected=true;
     var foot=document.querySelector('.gate-foot');
     if(foot){
-      foot.innerHTML='<span>凭证见应用「配置」页</span>'+
-        '<button type="button" class="gate-demo" id="hgDemoIn" title="不连接后端，用内置演示数据预览界面">以演示数据预览</button>';
+      foot.innerHTML='<span>Token 在左侧「配置 → 接口鉴权」页；或 NAS 上 '
+        + '/vol2/@appdata/hfish-guard/config.json 的 token 字段</span>'+
+        '<button type="button" class="gate-demo" id="hgDemoIn" '
+        + 'title="不连接后端，用内置样例数据看看界面长什么样（数据是假的，不是真实监控）">'
+        + '预览界面（演示数据，非真实监控）</button>';
       var b=$('#hgDemoIn');
       if(b)b.addEventListener('click',enterDemo);
     }
@@ -3572,6 +3588,7 @@ var HG_LIVE=(function(){
 
   function enterDemo(){
     state.authed=true;
+    document.body.setAttribute('data-demo','1');
     $('#gate').hidden=true;$('#app').hidden=false;
     setView('map');renderAll();updateClock();badge();
     toast('演示模式 · 未连接守护进程 :9705','warn');
@@ -3772,7 +3789,7 @@ var HG_LIVE=(function(){
   }
 
   return {boot:boot,login:login,push:push,sync:sync,tick:tick,
-          logout:logout,demo:enterDemo,
+          logout:logout,demo:enterDemo,badge:badge,
           get detected(){return detected;},get live(){return live;}};
 })();
 window.HG_LIVE=HG_LIVE;
@@ -3782,8 +3799,12 @@ renderAll();fillConfig();updateClock();setInterval(tick,1000);
 if(/[?&]selftest(=|&|$)/.test(location.search)){setTimeout(runSelfTest,220);}
 else if(/[?&]demo(=|&|$)/.test(location.search)){
   $('#gate').hidden=true;$('#app').hidden=false;state.authed=true;
+  document.body.setAttribute('data-demo','1');
   var dm=/[?&]demo=([^&#]*)/.exec(location.search);
   setView(dm&&dm[1]?dm[1]:'map');renderAll();updateClock();
+  if(window.HG_LIVE&&HG_LIVE.badge)window.HG_LIVE.badge();
+  var sw=document.querySelector('.mode-toggle');if(sw)sw.style.display='none';
+  var mb=document.querySelector('#modeBanner');if(mb)mb.style.display='none';
 }
 else{HG_LIVE.boot();}
 })();
