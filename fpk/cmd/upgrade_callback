@@ -15,6 +15,23 @@ if [ ! -x /usr/sbin/ipset ] && [ ! -x /sbin/ipset ] && [ ! -x /usr/bin/ipset ]; 
   fi
 fi
 
+# 0b) 归属地依赖：geoip2 解析器 + 城市库
+#     没有 geoip2 / 城市库时，归属地会全部显示「未知地域」。
+if ! /usr/bin/python3 -c "import geoip2.database" >/dev/null 2>&1; then
+  echo "hfish-guard: 未找到 geoip2，尝试安装" >&2
+  DEBIAN_FRONTEND=noninteractive timeout 180 apt-get install -y python3-geoip2 >/dev/null 2>&1 || true
+  if ! /usr/bin/python3 -c "import geoip2.database" >/dev/null 2>&1; then
+    timeout 240 pip3 install --break-system-packages -q geoip2 >/dev/null 2>&1 || true
+  fi
+  if ! /usr/bin/python3 -c "import geoip2.database" >/dev/null 2>&1; then
+    echo "hfish-guard: geoip2 仍不可用，归属地将显示为「未知地域」" >&2
+  fi
+fi
+GEO_DIR=/vol2/@appdata/hfish-guard
+if [ ! -f "${GEO_DIR}/DB-IP-City.mmdb" ] && [ ! -f "${GEO_DIR}/GeoLite2-City.mmdb" ]; then
+  echo "hfish-guard: 缺少 GeoIP 城市库，归属地不可用。安装命令：" >&2
+  echo "  curl -sL -o /tmp/dbip.mmdb.gz https://download.db-ip.com/free/dbip-city-lite-\$(date +%Y-%m).mmdb.gz && gunzip -f /tmp/dbip.mmdb.gz && mv /tmp/dbip-city-lite-*.mmdb ${GEO_DIR}/DB-IP-City.mmdb && systemctl restart hfish-guard" >&2
+fi
 chmod 755 "${BIN}/guard.py" 2>/dev/null || true
 mkdir -p "${DATA}"
 

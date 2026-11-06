@@ -32,6 +32,39 @@
 
 现在改成：内核用 `hashlimit` 直接判定（`--hashlimit-above 阈值/窗口 --hashlimit-burst 阈值`，`--hashlimit-mode srcip`），用户态只负责「取走命中 → 落库 → 管 TTL」。流量曲线仍读每条端口规则自己的包计数器（`iptables -vnxL` 的精确值），所以态势图上的数值是真的。
 
+## 归属地（GeoIP）
+
+事件表里的「归属地」来自 IP 地理库，数据源按优先级取：
+
+| 优先级 | 数据源 | 说明 | 结果精度 |
+|---|---|---|---|
+| 1 | MaxMind / DB-IP 的 `.mmdb` | 城市库，守卫用 `geoip2` 解析 | 精确到城市 |
+| 2 | `geo.json` | 自定义表，放在数据目录，`{ip: {cc, cn, city, lat, lon}}`，兜底 mmdb 没收录的 | 国家级（自己维护） |
+| 3 | 内置网段推算表 | 只有十几条粗粒度规则（如 `5.` → 俄罗斯） | 粗糙，多数查不到 |
+| 4 | 兜底 | — | 显示「未知地域」 |
+
+> 顺序是「mmdb 优先、geo.json 兜底」：早期把 geo.json 放在最前，结果 HFish 情报里只有国家没有城市，
+> 反而把 mmdb 的城市级结果挡住了。
+
+**没装城市库时，NAS 上每一个公网 IP 都会显示「未知地域」**——这不是 bug，是没有数据源。
+配置页「归属地数据源」区块会显示当前用的哪个，并给出一条可直接复制的安装命令：
+
+```bash
+# DB-IP 免费城市库（无需注册，每月更新）
+curl -sL -o /tmp/dbip.mmdb.gz \
+  https://download.db-ip.com/free/dbip-city-lite-$(date +%Y-%m).mmdb.gz \
+  && gunzip -f /tmp/dbip.mmdb.gz \
+  && mv /tmp/dbip-city-lite-*.mmdb /vol2/@appdata/hfish-guard/DB-IP-City.mmdb \
+  && systemctl restart hfish-guard
+```
+
+解析器 `geoip2` 由安装/升级钩子自动装（`apt install python3-geoip2`），不用手工处理。
+
+> DB-IP 的库不提供 `zh-CN` 名称，守卫内置两张映射表兜底：
+> **ISO 3166 → 中文国名**（123 条，显示「美国」而不是 `United States`）
+> 与 **常用城市英文名 → 中文名**（153 条，显示「巴黎」「伦敦」而不是 `Paris`/`London`）。
+> 库里的城市名带括号后缀的（`Seongnam-si (Buljeong-ro)`）会自动截到主名。
+
 ## 与蜜罐（fnos-hive）的联动方式
 
 - **端口面联动**：守卫监视的端口列表 = 蜜罐服务端口（默认 6379,9200,9000,8080,8081,9198,9080,9092,2022,7878）。hive 侧改了服务端口，在守卫 UI 里同步改监视端口即可，**即时生效、无需重启**；
@@ -103,6 +136,7 @@ syslog 官方字段全部解析（`src_ip` / `scan_port` / `attack_type` / `type
 | hfish.auto_block_max_per_min | 120 | 自动封禁熔断：每分钟最多封多少个，超出只记事件；0=不限 |
 | hfish.max_blocks | 20000 | 黑名单容量上限，到顶不再新增；0=不限 |
 | hfish.scan_fanout | 5 | 扫描类告警：同源命中多少个**不同端口**才算扫描者并封禁；0=每条都封 |
+| 归属地数据源 | 无 | 城市库文件路径（`/vol2/@appdata/hfish-guard/DB-IP-City.mmdb`）；没装时所有公网 IP 显示「未知地域」 |
 | hfish.api_base / api_key / verify_tls | 空 / 空 / false | HFish 开放 API（只读情报），默认自签证书 |
 | hfish.webhook_token | 空 | `/api/hfish/webhook` 的校验串，空则用主 token |
 

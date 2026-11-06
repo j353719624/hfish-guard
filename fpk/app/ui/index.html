@@ -2157,6 +2157,18 @@ select.input{background-color:rgba(3,12,24,.72)}
             </div>
           </div>
           <div class="panel mt-16">
+            <div class="section-label">归属地数据源</div>
+            <div class="panel-body">
+              <div class="hint" id="cfgGeoHint">—</div>
+              <div id="cfgGeoCmdWrap" style="display:none;margin-top:10px">
+                <div class="token-box" style="display:block;padding:10px 12px;white-space:pre-wrap;word-break:break-all"><code id="cfgGeoCmd">—</code></div>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <button class="btn" type="button" data-action="copy-geo-cmd"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg>复制安装命令</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="panel mt-16">
             <div class="section-label">接口鉴权</div>
             <div class="panel-body" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
               <div class="token-box" style="flex:1"><svg class="icon" aria-hidden="true" style="color:var(--t3)"><use href="#i-shield"/></svg><code id="cfgToken">hfish-guard-demo</code></div>
@@ -2245,6 +2257,17 @@ var GEO_PREFIX=[
   {re:/^198\./,cc:'US',cn:'美国',city:'北美段',lat:34.0,lon:-118.2}
 ];
 var PRIVATE_RE=/^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/;
+/* 后端 GeoIP 的结果转成前端 GEO 字典格式。
+   后端返回 {cc, cn, city, lat, lon, org, source}；没有经纬度时保留 null，
+   这样列表能显示「美国 · 纽约」，地球仪则跳过投影（而不是显示「未知地域」）。 */
+function mkGeo(g){
+  if(!g)return null;
+  var lat=(g.lat===null||g.lat===undefined)?null:Number(g.lat);
+  var lon=(g.lon===null||g.lon===undefined)?null:Number(g.lon);
+  return {cc:g.cc||'--',cn:g.cn||'未知',city:g.city||'-',
+          lat:isNaN(lat)?null:lat,lon:isNaN(lon)?null:lon,
+          org:g.org||'-',risk:'mid',approx:g.source!=='mmdb'};
+}
 function geoOf(ip){
   var s=String(ip||'').split('/')[0];
   if(GEO[s])return GEO[s];
@@ -2262,8 +2285,11 @@ function geoOf(ip){
 function geoText(ip){var g=geoOf(ip);return (g.cc+' '+g.cn+' '+g.city+' '+g.org).toLowerCase();}
 function geoBadge(ip,compact){
   var g=geoOf(ip);
-  return '<span class="geo'+(g.risk==='high'?' is-high':g.risk==='safe'?' is-safe':'')+'" title="'+esc(g.cn+' · '+g.city+' · '+g.org+(g.approx?'（推算）':''))+'">'+
-    '<i class="geo-cc">'+g.cc+'</i><span class="geo-name">'+esc(g.cn)+(compact?'':' · '+esc(g.city))+(g.approx?' *':'')+'</span></span>';
+  /* 城市为占位符时不要显示「 · -」这种脏尾巴 */
+  var city=(g.city&&g.city!=='-'&&g.city!=='未收录网段')?g.city:'';
+  var tail=compact?'':(city?' · '+esc(city):'');
+  return '<span class="geo'+(g.risk==='high'?' is-high':g.risk==='safe'?' is-safe':'')+'" title="'+esc(g.cn+(city?' · '+city:'')+' · '+g.org+(g.approx?'（推算）':''))+'">'+
+    '<i class="geo-cc">'+g.cc+'</i><span class="geo-name">'+esc(g.cn)+tail+(g.approx?' *':'')+'</span></span>';
 }
 /* 蜜罐节点：所有触碰的终点 */
 var TARGETS=[
@@ -2444,7 +2470,7 @@ function renderBlacklist(){
   $('#blRows').innerHTML=state.blacklist.map(function(b){
     var left=(b.at+b.ttl*1000-now)/1000,pct=Math.max(0,Math.min(100,Math.round(left/b.ttl*100)));
     return '<tr><td class="mono strong">'+esc(b.ip)+'</td>'+
-      '<td>'+geoBadge(b.ip,true)+'</td>'+
+      '<td>'+geoBadge(b.ip,false)+'</td>'+
       '<td class="mono">'+b.port+'<span class="port-name">'+esc(portName(b.port))+'</span></td>'+
       '<td class="num mono">'+b.packets+'</td>'+
       '<td class="mono dim">'+fmtDate(b.at)+'</td>'+
@@ -2500,6 +2526,7 @@ function fillConfig(){
   if($('#cfgHfishKey'))$('#cfgHfishKey').value=hf.api_key||'';
   if($('#cfgHfishWtok'))$('#cfgHfishWtok').value=hf.webhook_token||'';
   renderHfishHint();
+  renderGeoHint();
   ['cfgThresholdErr','cfgWindowErr','cfgPollErr','cfgTtlErr','portErr'].forEach(function(id){$('#'+id).textContent='';});
   state.cfgDirty=false;
 }
@@ -2514,6 +2541,40 @@ function renderHfishHint(){
   el.textContent='当前：'+(l.enabled?'事件接入已开启':'事件接入未开启')+' · syslog '+listen+
     ' · 已收 '+(rec.syslog||0)+' 条 syslog / '+(rec.webhook||0)+' 条 webhook'+
     ' · 开放 API '+(l.api_configured?(l.api_ok?'正常（情报 '+l.intel_count+' 条）':('异常 '+(l.api_error||''))):'未配置');
+}
+function renderGeoHint(){
+  var el=$('#cfgGeoHint');if(!el)return;
+  var cmd=$('#cfgGeoCmd'),wrap=$('#cfgGeoCmdWrap');
+  var GEO_CMD='curl -sL -o /tmp/dbip.mmdb.gz https://download.db-ip.com/free/dbip-city-lite-$(date +%Y-%m).mmdb.gz && gunzip -f /tmp/dbip.mmdb.gz && mv /tmp/dbip-city-lite-*.mmdb /vol2/@appdata/hfish-guard/DB-IP-City.mmdb && systemctl restart hfish-guard';
+  if(cmd)cmd.textContent=GEO_CMD;
+  if(!(window.HG_LIVE&&HG_LIVE.live)){
+    el.textContent='演示模式：连接 guard.py 后显示当前归属地数据源';
+    if(wrap)wrap.style.display='none';
+    return;
+  }
+  var g=state.geoInfo||{};
+  var src=g.source||state.geoSource||'none';
+  var text='';
+  if(src==='mmdb'){
+    text='当前：MaxMind/DB-IP 城市库（精确到城市）· '+(g.mmdb||'已加载');
+  }else if(src==='custom'){
+    text='当前：自定义 geo.json 表（'+(g.custom||0)+' 条）';
+  }else if(src==='approx'){
+    text='当前：内置网段推算（只有十几条粗粒度规则，大部分攻击源会显示「未知地域」）';
+  }else{
+    text='当前：<b>没有归属地数据源</b>，所有公网 IP 都会显示「未知地域」';
+  }
+  el.innerHTML=esc(text)+' ';
+  var need=(src!=='mmdb');
+  if(wrap)wrap.style.display=need?'block':'none';
+  if(need){
+    var b=document.createElement('span');
+    b.className='dim';
+    b.textContent=src==='none'
+      ?'安装城市库（DB-IP 免费版，无需注册）：'
+      :'想要城市级精度，装一份城市库：';
+    el.appendChild(b);
+  }
 }
 function renderGlobe(){
   var seen={},n=0;
@@ -2835,7 +2896,7 @@ function renderMap(){
   /* 所有数据块就位后统一同步聚焦态 */
   applyFocus();
 }
-function renderAll(){renderStatus();renderEvents();renderBlacklist();renderWhitelist();renderGlobe();renderSmallWire();renderMap();}
+function renderAll(){renderStatus();renderEvents();renderBlacklist();renderWhitelist();renderGlobe();renderSmallWire();renderMap();renderGeoHint();}
 
 /* ---------------- 视图与交互 ---------------- */
 var VIEWS=['map','status','events','blacklist','whitelist','config'];
@@ -3109,6 +3170,10 @@ document.addEventListener('click',function(e){
     state.token='hg-'+Math.random().toString(16).slice(2,10)+Math.random().toString(16).slice(2,10);
     $('#cfgToken').textContent=state.token;
     toast('新凭证已生成 · 下次登录需使用新凭证','warn');
+  }
+  if(a==='copy-geo-cmd'){
+    var c=$('#cfgGeoCmd');
+    if(c)copyText(c.textContent,'安装命令已复制到剪贴板');
   }
   if(a==='cfg-reset'){fillConfig();toast('已恢复为当前生效配置','ok');}
 });
@@ -3646,12 +3711,15 @@ var HG_LIVE=(function(){
     return (rows||[]).map(function(r){
       var v=r.verdict==='over'?'over':(r.verdict==='manual'?'manual':
         (r.verdict==='expired'?'expired':(r.verdict==='hfish'?'hfish':'normal')));
+      /* 后端已经查好归属地就直接用，别再落回前端那十条离线规则 */
+      if(r.geo&&r.geo.cn){var g=mkGeo(r.geo);if(g)GEO[r.ip]=g;}
       return {id:r.id,ts:r.ts,ip:r.ip,port:r.port,packets:r.packets,verdict:v,
               action:r.action,detail:r.detail||''};
     });
   }
   function mapBlocks(rows){
     return (rows||[]).map(function(b){
+      if(b.geo&&b.geo.cn){var g=mkGeo(b.geo);if(g)GEO[b.ip]=g;}
       return {ip:b.ip,port:b.port||0,packets:b.packets||0,at:b.at,
               ttl:b.ttl||3600,note:b.reason||'',permanent:!!b.permanent};
     });
@@ -3665,18 +3733,23 @@ var HG_LIVE=(function(){
   /* 把后端 geo 补进前端的 GEO 字典，地球仪才有真实落点 */
   function geoWarm(){
     var list=[],seen={};
-    state.events.forEach(function(e){
-      if(!e.ip||GEO[e.ip]||PRIVATE_RE.test(e.ip)||seen[e.ip]||geoAsked[e.ip])return;
-      seen[e.ip]=1;list.push(e.ip);
-    });
+    function pick(ip){
+      if(!ip||GEO[ip]||PRIVATE_RE.test(ip)||seen[ip]||geoAsked[ip])return;
+      seen[ip]=1;list.push(ip);
+    }
+    state.events.forEach(function(e){pick(e.ip);});
+    /* 黑名单里的 IP 未必都出现在事件表里，也要补查，否则表格里是「未知地域」 */
+    (state.blacklist||[]).forEach(function(b){pick(b.ip);});
     if(!list.length)return;
     var batch=list.slice(0,60),changed=false;
     batch.forEach(function(ip){geoAsked[ip]=1;});
     req('/api/geo?ips='+encodeURIComponent(batch.join(','))).then(function(res){
       (res.items||[]).forEach(function(g){
-        if(!g||g.lat===null||g.lat===undefined)return;
-        GEO[g.ip]={cc:g.cc||'--',cn:g.cn||'未知',city:g.city||'-',lat:g.lat,lon:g.lon,
-                   org:g.org||'-',risk:'mid',approx:g.source!=='mmdb'};
+        /* 没有经纬度也要收下：列表能显示国家名，只有地球仪不投影。
+           原来这里直接 return，导致后端查到了国家却被前端丢掉。 */
+        if(!g||!g.ip)return;
+        var m=mkGeo(g);if(!m)return;
+        GEO[g.ip]=m;
         changed=true;
       });
       if(changed)renderAll();
@@ -3701,6 +3774,7 @@ var HG_LIVE=(function(){
     state.kernelInfo=st.kernel||null;
     state.link=st.link||null;
     state.geoSource=st.geo_source||'';
+    state.geoInfo=st.geo||(st.geo_source?{source:st.geo_source}:null);
     state.portState=st.port_state||[];
     state.hfishLink=(st.link||{}).hfish||null;
     if(cfg&&cfg.hfish){

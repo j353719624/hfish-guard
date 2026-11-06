@@ -209,6 +209,17 @@ guard 侧：UI「配置 → HFish 联动」里勾「接入 HFish 告警」，sys
 
 解析是**容错的**：JSON、`key: value`、`key=value`、甚至只有一行带 IP 的纯文本都能吃；系统告警（节点离线、蜜罐离线）没有 `src_ip`，会被计入 `received.skipped` 而不是当成攻击。
 
+### 7.2.0 归属地数据源（v1.6.0）
+
+「未知地域」不是 bug，是**没有数据源**：守卫只带一张十几行的网段推算表，
+绝大多数公网 IP 查不到国家。v1.6.0 起：
+
+- 数据源优先级：`geo.json`（自定义） > MaxMind/DB-IP `.mmdb` > 内置推算表 > 兜底
+- `install/upgrade_callback` 自动装解析器 `geoip2`（apt 的 `python3-geoip2`）
+- `status.geo` 暴露 `{source, mmdb, custom, ready}`，UI 配置页据此显示当前数据源；
+  没装城市库时给出可复制的安装命令（DB-IP 免费库，无需注册）
+- DB-IP 库没有 `zh-CN` 名称 → 内置 `CC_ZH`（ISO 3166 alpha-2 → 中文国名，123 条）兜底
+
 ### 7.2.1 真机接入踩到的三个坑（v1.4.2/1.4.3 已修）
 
 1. **HFish 的库不一定是 SQLite**。本机 `hfish-data/config.toml` 写的是 `type = "mysql"`，

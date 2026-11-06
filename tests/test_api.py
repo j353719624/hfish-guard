@@ -293,6 +293,26 @@ class GuardApiTest(ApiBase):
             self.assertEqual(code, 302, "%s 应重定向" % path)
             self.assertIn("token=%s" % self.token, loc, "%s 重定向应带上当前 token" % path)
 
+    def test_11c_geo_source_reported(self):
+        """status 必须暴露归属地数据源，UI 才能解释「未知地域」的成因。"""
+        st = self.call("GET", "/api/status")
+        self.assertIn("geo", st, "status 里缺少 geo 字段")
+        geo = st["geo"]
+        for k in ("source", "mmdb", "custom", "ready"):
+            self.assertIn(k, geo, "geo 字段缺少 %s" % k)
+        self.assertIn(geo["source"], ("mmdb", "custom", "approx", "none"))
+
+    def test_11d_cc_zh_fallback_table(self):
+        """ISO → 中文国名映射：mmdb 没有 zh-CN 名称时靠它兜底。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("g", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        self.assertGreaterEqual(len(g.CC_ZH), 60, "映射表条目太少")
+        for cc, name in (("US", "美国"), ("CN", "中国"), ("RU", "俄罗斯"),
+                         ("KR", "韩国"), ("TW", "中国台湾"), ("HK", "中国香港")):
+            self.assertEqual(g.CC_ZH.get(cc), name, "%s 的中文名不对" % cc)
+
     def test_11_static_ui(self):
         code, body = self.call("GET", "/", raw=True)
         self.assertEqual(code, 200)
