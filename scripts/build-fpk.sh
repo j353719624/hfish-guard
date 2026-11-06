@@ -21,11 +21,38 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/pkg"
 
-# 注入自检断言条数（统计 runSelfTest 里的 errs.push 数量并写回页面）
+# 校验 + 构建前端
+# v1.8 起前端是 Vue 3 + Vite 工程（ui/ 目录），产物输出到 fpk/app/ui。
+# 构建在这里跑：NAS 上不需要 Node，构建产物随 fpk 一起分发（与 fnOS/HFish 同构）。
+#
+# 踩过的坑保留在这里提醒：手工改 HTML 时漏一个双引号，整个 <script> 挂掉，
+# 页面白屏且没有任何报错。现在由 vue-tsc + Vite 在构建期拦这类问题。
+UI_SRC="$ROOT/ui"
+if [ -d "$UI_SRC" ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    echo "未找到 node，无法构建 Vue 前端（ui/ 目录存在但缺少 node）" >&2
+    exit 1
+  fi
+  echo "---- 构建 Vue 前端 ----"
+  ( cd "$UI_SRC" && npm run build )
+  # 产物必须存在，否则装上去是白屏
+  if [ ! -f "$SRC/app/ui/index.html" ] || [ ! -f "$SRC/app/ui/assets/guard.js" ]; then
+    echo "前端构建产物缺失（index.html / assets/guard.js）" >&2
+    exit 1
+  fi
+  # 产物里不能有 sourcemap 或 node_modules
+  if find "$SRC/app/ui" \( -name "*.map" -o -name "node_modules" \) 2>/dev/null | grep -q .; then
+    echo "前端产物里混入了 sourcemap 或 node_modules，请清理后重试" >&2
+    exit 1
+  fi
+  echo "ui build: ok"
+fi
+
+# 注入自检断言条数（老版单文件 HTML 用的；Vue 版会自动跳过）
 # 以前页面里写死 checks=54，加了新断言忘了改数字，自检就会显示得比实际覆盖多。
 python3 "$ROOT/scripts/inject-selftest-count.py" "$SRC/app/ui/index.html"
 
-# 应用文件单独打成 app.tgz，再和 cmd/config/图标一起组成 fpk
+# 前端构建完成后再打 app.tgz —— 否则包里带的是上一次构建的旧产物
 # 排除编译缓存/临时文件（本机 py_compile 会生成 115KB 的 __pycache__，不该进包）
 tar -czf "$TMP/pkg/app.tgz" -C "$SRC/app" \
   --exclude='__pycache__' --exclude='*.pyc' --exclude='*.pyo' --exclude='.DS_Store' .
@@ -33,30 +60,10 @@ cp -r "$SRC/cmd" "$SRC/config" "$SRC/ICON.PNG" "$SRC/ICON_256.PNG" "$SRC/manifes
 
 ( cd "$TMP/pkg" && tar -czf "$OUT/$APP.fpk" . )
 
-# 校验：包内不得出现 pyc，且版本号与 manifest 一致
+# 校验：包内不得出现 pyc
 if tar -xzOf "$OUT/$APP.fpk" ./app.tgz | tar -tzf - | grep -qE '(__pycache__|\.pyc$)'; then
   echo "构建产物里混入了 .pyc，请清理 fpk/app 后重试" >&2
   exit 1
-fi
-
-# 校验：UI 内联脚本必须语法正确
-# 踩过的坑：手工改 HTML 时漏了一个双引号，整个 <script> 挂掉，页面白屏且
-# 没有任何报错（浏览器只说「HG_LIVE is undefined」）。这里用 node --check 拦一道。
-if command -v node >/dev/null 2>&1; then
-  python3 - "$SRC/app/ui/index.html" "$TMP/ui.js" <<'PY'
-import io, re, sys
-src, dst = sys.argv[1], sys.argv[2]
-html = io.open(src, encoding="utf-8").read()
-blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
-if not blocks:
-    sys.exit("UI 里没找到内联脚本")
-io.open(dst, "w", encoding="utf-8", newline="\n").write(blocks[0])
-PY
-  if ! node --check "$TMP/ui.js"; then
-    echo "UI 内联脚本语法错误，已中止构建" >&2
-    exit 1
-  fi
-  echo "ui script: syntax ok"
 fi
 
 SIZE=$(stat -c %s "$OUT/$APP.fpk")

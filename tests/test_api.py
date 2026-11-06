@@ -408,8 +408,25 @@ class GuardApiTest(ApiBase):
     def test_11_static_ui(self):
         code, body = self.call("GET", "/", raw=True)
         self.assertEqual(code, 200)
-        self.assertIn(b"<!DOCTYPE html>", body[:200])
+        # 大小写不敏感：Vite 产物是 <!doctype html>，手写的是 <!DOCTYPE html>
+        self.assertIn(b"doctype html", body[:200].lower())
         self.assertEqual(self.status_code("GET", "/../etc/passwd", token=None) in (400, 403, 404), True)
+
+    def test_11b_ui_assets_are_served(self):
+        """UI 目录下的静态资源必须能取到（Vue 构建产物在 assets/ 下）。
+
+        回归：静态路由原来直接把请求路径拼到 UI 根目录，
+        页面在 /web/ 下、产物在 <ui>/assets/…，于是 /web/assets/guard.js
+        会拼成 <ui>/web/assets/guard.js → 404 → 整个面板白屏。
+        """
+        html = self.call("GET", "/", raw=True)[1].decode("utf-8", "replace")
+        import re
+        refs = re.findall(r'(?:src|href)="\.?/?([^"]+\.(?:js|css))"', html)
+        self.assertTrue(refs, "index.html 里应引用构建产物，实际没找到：%s" % html[:200])
+        for ref in refs:
+            path = "/" + ref.lstrip("./")
+            code = self.status_code("GET", path, token=None)
+            self.assertEqual(code, 200, "静态资源取不到：%s" % path)
 
     def test_12_token_rotation(self):
         old = self.token

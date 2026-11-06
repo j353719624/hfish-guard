@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 APP_NAME = "hfish-guard"
 
 BASE_DIR = os.environ.get("HFISH_GUARD_DATA", "/vol2/@appdata/hfish-guard")
@@ -2356,7 +2356,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "未知接口")
             return
         # 静态资源（images/* 等）
+        # 静态资源：UI 根目录下的相对路径。
+        # 页面入口是 /web/，静态资源实际在 <ui>/assets/… ，所以要剥掉 /web 前缀。
+        # （原来只有单文件 index.html，走的是显式 _static("index.html")，没暴露这个问题；
+        #   改用 Vue 构建产物后 index.html 里会引用 ./assets/guard.js，必须能取到。）
         rel = path.lstrip("/")
+        if rel.startswith("web/"):
+            rel = rel[4:]
+        elif rel == "web":
+            rel = "index.html"
         if rel and ".." not in rel:
             self._static(rel)
             return

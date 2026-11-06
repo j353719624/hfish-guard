@@ -1,0 +1,143 @@
+/* ============================================================
+   设计令牌 —— 取自 fnOS 系统前端的 Semi Design 体系
+   （实测 /usr/trim/www/assets/index-*.css 的 --semi-* 变量）
+   守卫沿用飞牛原生观感：浅色为主、克制用色、靠留白与边框分层。
+   ============================================================ */
+:root {
+  /* ---- 品牌色（fnOS brand-4 = rgb(0,102,255)）---- */
+  --brand-0: #002570;
+  --brand-1: #003494;
+  --brand-2: #0043b8;
+  --brand-3: #0054db;
+  --brand-4: #0066ff;
+  --brand-5: #0066ff;
+  --brand-6: #005eeb;
+  --brand-7: #0043b8;
+  --brand-8: #002d70;
+  --brand-9: #ebf4ff;
+  --brand-10: #e6f4ff;
+
+  /* ---- 中性色（浅色主题）---- */
+  --grey-0: #fafafa;
+  --grey-1: #f5f5f5;
+  --grey-2: #ebebeb;
+  --grey-3: #9fa0a1;
+  --grey-4: #7c7d7f;
+  --grey-5: #5a5b5c;
+  --grey-6: #4b4b4b;
+  --grey-7: #303030;
+  --grey-8: #1e1e21;
+  --grey-9: #0b0b0c;
+  --grey-10: #000000;
+
+  /* ---- 语义色 ---- */
+  --red-5: #db382c;
+  --red-6: #b7251f;
+  --red-9: #fdeeee;
+  --orange-5: #ffa100;
+  --orange-6: #d57c00;
+  --orange-9: #fff5e6;
+  --yellow-5: #ffdd33;
+  --yellow-9: #fffaeb;
+  --green-5: #009e61;
+  --green-6: #008453;
+  --green-9: #e8f8f1;
+  --cyan-5: #00bdde;
+  --cyan-6: #009ab9;
+  --cyan-9: #e5f8fc;
+
+  /* ---- 语义别名（组件里只用这些）---- */
+  --color-primary: var(--brand-4);
+  --color-primary-hover: var(--brand-3);
+  --color-primary-active: var(--brand-6);
+  --color-primary-bg: var(--brand-9);
+  --color-success: var(--green-5);
+  --color-success-bg: var(--green-9);
+  --color-warning: var(--orange-5);
+  --color-warning-bg: var(--orange-9);
+  --color-danger: var(--red-5);
+  --color-danger-bg: var(--red-9);
+  --color-info: var(--cyan-5);
+  --color-info-bg: var(--cyan-9);
+
+  /* ---- 文本 ---- */
+  --text-1: var(--grey-9);
+  --text-2: rgba(11, 11, 12, 0.75);
+  --text-3: rgba(11, 11, 12, 0.55);
+  --text-4: rgba(11, 11, 12, 0.35);
+  --text-inverse: #ffffff;
+
+  /* ---- 背景 ---- */
+  --bg-page: var(--grey-1);
+  --bg-card: #ffffff;
+  --bg-card-2: var(--grey-0);
+  --bg-hover: rgba(11, 11, 12, 0.04);
+  --bg-active: var(--brand-9);
+
+  /* ---- 边框 ---- */
+  --border: rgba(11, 11, 12, 0.08);
+  --border-strong: rgba(11, 11, 12, 0.16);
+  --border-hover: rgba(11, 11, 12, 0.24);
+
+  /* ---- 圆角（fnOS 实测值）---- */
+  --radius-xs: 3px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* ---- 阴影（fnOS 极轻，靠边框分层）---- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.08), 0 0 1px rgba(0, 0, 0, 0.04);
+  --shadow-3: 0 10px 20px rgba(0, 0, 0, 0.08), 0 10px 40px rgba(0, 0, 0, 0.04);
+  --shadow-dropdown: 0 12px 42px rgba(20, 23, 26, 0.12), 0 8px 18px rgba(20, 23, 26, 0.06);
+
+  /* ---- 字体（fnOS 实测）---- */
+  --font: 'PingFang SC', 'SF Pro Text', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-mono: 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
+  --fs-3xl: 30px;
+
+  /* ---- 间距 ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+
+  /* ---- 布局 ---- */
+  --rail-w: 200px;
+  --topbar-h: 56px;
+}
+
+/* 深色主题（fnOS 也有，跟随系统切换） */
+html.dark {
+  --text-1: #f7f7f7;
+  --text-2: rgba(255, 255, 255, 0.75);
+  --text-3: rgba(255, 255, 255, 0.55);
+  --text-4: rgba(255, 255, 255, 0.35);
+  --bg-page: #1a1e23;
+  --bg-card: #23262b;
+  --bg-card-2: #2a2e33;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(0, 102, 255, 0.16);
+  --border: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --border-hover: rgba(255, 255, 255, 0.24);
+  --brand-9: rgba(0, 102, 255, 0.16);
+  --red-9: rgba(219, 56, 44, 0.16);
+  --green-9: rgba(0, 158, 97, 0.16);
+  --orange-9: rgba(255, 161, 0, 0.16);
+  --cyan-9: rgba(0, 189, 222, 0.16);
+}

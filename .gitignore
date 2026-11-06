@@ -10,3 +10,10 @@ app.tgz
 *.pid
 __pycache__/
 *.pyc
+
+# 前端依赖（Vue 工程，产物已进 fpk/app/ui）
+ui/node_modules/
+
+# 前端构建中间产物（正式产物在 fpk/app/ui/assets，由 fpk 一起分发）
+ui/.vite/
+*.tsbuildinfo
