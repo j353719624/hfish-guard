@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { state, sync, setMode, logout, type ViewName } from '@/store/state'
-import MapView from '@/views/MapView.vue'
 import StatusView from '@/views/StatusView.vue'
 import EventsView from '@/views/EventsView.vue'
 import BlacklistView from '@/views/BlacklistView.vue'
@@ -9,7 +8,6 @@ import WhitelistView from '@/views/WhitelistView.vue'
 import ConfigView from '@/views/ConfigView.vue'
 
 const NAV: { key: ViewName; label: string; icon: string; badge?: () => number }[] = [
-  { key: 'map', label: '全球态势', icon: 'globe' },
   { key: 'status', label: '状态总览', icon: 'grid' },
   { key: 'events', label: '事件流', icon: 'list', badge: () => state.events.length },
   { key: 'blacklist', label: '黑名单', icon: 'ban', badge: () => state.blacklist.length },
@@ -53,7 +51,7 @@ async function toggleMode(): Promise<void> {
       <nav class="rail-nav">
         <div class="rail-group">监控</div>
         <button
-          v-for="n in NAV.slice(0, 2)" :key="n.key"
+          v-for="n in NAV.slice(0, 1)" :key="n.key"
           class="nav-item" :class="{ 'is-on': view === n.key }"
           type="button" @click="state.view = n.key"
         >
@@ -63,7 +61,7 @@ async function toggleMode(): Promise<void> {
 
         <div class="rail-group">处置</div>
         <button
-          v-for="n in NAV.slice(2, 5)" :key="n.key"
+          v-for="n in NAV.slice(1, 4)" :key="n.key"
           class="nav-item" :class="{ 'is-on': view === n.key }"
           type="button" @click="state.view = n.key"
         >
@@ -130,8 +128,7 @@ async function toggleMode(): Promise<void> {
       </div>
 
       <main class="content">
-        <MapView v-if="view === 'map'" />
-        <StatusView v-else-if="view === 'status'" />
+        <StatusView v-if="view === 'status'" />
         <EventsView v-else-if="view === 'events'" />
         <BlacklistView v-else-if="view === 'blacklist'" />
         <WhitelistView v-else-if="view === 'whitelist'" />
@@ -148,6 +145,9 @@ async function toggleMode(): Promise<void> {
 .rail {
   width: var(--rail-w);
   flex: 0 0 var(--rail-w);
+  /* min-height:0 —— 不加的话 flex item 会被内容撑高，
+     主区滚动时侧栏跟着一起长，底部「退出登录」就跑到内容中间去了。 */
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--bg-card);
@@ -209,8 +209,7 @@ async function toggleMode(): Promise<void> {
 .conn.is-off .conn-dot { background: var(--color-danger); }
 
 /* ---------- 主区 ---------- */
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.topbar {
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }.topbar {
   height: var(--topbar-h); flex: 0 0 var(--topbar-h);
   display: flex; align-items: center; gap: var(--sp-4);
   padding: 0 var(--sp-6);

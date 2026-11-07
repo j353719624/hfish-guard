@@ -5,11 +5,11 @@
 import { reactive, computed } from 'vue'
 import { api, ApiError, getToken, setToken, clearToken, type Status, type EventItem, type BlacklistItem, type WhitelistItem, type GuardConfig, type Geo } from '@/api/guard'
 
-export type ViewName = 'map' | 'status' | 'events' | 'blacklist' | 'whitelist' | 'config'
+export type ViewName = 'status' | 'events' | 'blacklist' | 'whitelist' | 'config'
 
 export const state = reactive({
   authed: false,
-  view: 'map' as ViewName,
+  view: 'status' as ViewName,
   demo: false,
 
   // 数据

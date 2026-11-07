@@ -4,7 +4,8 @@ import { computed } from 'vue'
 import { state } from '@/store/state'
 
 const W = 560
-const H = 120
+// 高度要跟卡片宽度配得上：卡片有 700+px 宽，120px 高的图会被压得很扁
+const H = 170
 const PAD = 6
 
 const series = computed(() => {
@@ -103,7 +104,7 @@ const idle = computed(() => {
 
 <style scoped>
 .wave { display: flex; flex-direction: column; gap: var(--sp-2); }
-.wave svg { width: 100%; height: 120px; display: block; }
+.wave svg { width: 100%; height: 170px; display: block; }
 .wave-grid { stroke: var(--border); stroke-width: 1; }
 .wave-line { fill: none; stroke: var(--color-primary); stroke-width: 2; stroke-linejoin: round; }
 .wave-idle { fill: var(--text-3); font-size: 13px; font-family: var(--font); }

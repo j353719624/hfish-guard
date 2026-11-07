@@ -65,7 +65,7 @@ export async function runSelfTest(): Promise<void> {
     // ---- 结构 ----
     chk(document.getElementById('app'), 'app:missing')
     chk(document.querySelector('.rail'), 'rail:missing')
-    chk(count('.rail .nav-item') === 6, 'rail:nav-count=' + count('.rail .nav-item'))
+    chk(count('.rail .nav-item') === 5, 'rail:nav-count=' + count('.rail .nav-item'))
     chk(document.querySelector('.topbar'), 'topbar:missing')
     chk(document.querySelector('.mode-switch'), 'mode:switch-missing')
     chk(document.querySelector('.banner'), 'banner:missing')
@@ -101,11 +101,11 @@ export async function runSelfTest(): Promise<void> {
 
     // ---- 视图切换 ----
     const navs = Array.from(document.querySelectorAll('.rail .nav-item')) as HTMLElement[]
-    chk(navs.length === 6, 'nav:count')
+    chk(navs.length === 5, 'nav:count')
 
     // 逐个视图切过去，确认每个都渲染出内容
-    // 顺序对应左侧导航：态势 / 总览 / 事件 / 黑名单 / 白名单 / 配置
-    const viewMarkers = ['.kpi-row', '.kv-grid', '.table', '.card', '.card', '.card']
+    // 顺序对应左侧导航：状态总览 / 事件 / 黑名单 / 白名单 / 配置
+    const viewMarkers = ['.kpi-row', '.table', '.card', '.card', '.card']
     for (let i = 0; i < navs.length; i++) {
       navs[i].click()
       await nextTick()
@@ -116,7 +116,7 @@ export async function runSelfTest(): Promise<void> {
     }
 
     // ---- 事件流表格 ----
-    navs[2].click()
+    navs[1].click()
     await nextTick()
     await sleep(30)
     const ths = document.querySelectorAll('.content .table thead th')
@@ -144,7 +144,7 @@ export async function runSelfTest(): Promise<void> {
     }
 
     // ---- 黑名单操作按钮 ----
-    navs[3].click()
+    navs[2].click()
     await nextTick()
     await sleep(30)
     if (state.blacklist.length) {
@@ -152,13 +152,13 @@ export async function runSelfTest(): Promise<void> {
     }
 
     // ---- 白名单表 ----
-    navs[4].click()
+    navs[3].click()
     await nextTick()
     await sleep(30)
     chk(!!document.getElementById('wlCidr'), 'whitelist:form')
 
     // ---- 配置页 ----
-    navs[5].click()
+    navs[4].click()
     await nextTick()
     await sleep(30)
     chk(!!document.getElementById('cfgThreshold'), 'config:threshold')
